@@ -1,0 +1,115 @@
+typesafety version 0.01
+=======================
+
+typesafety.pm - compile-time type usage static analysis 
+
+SYNOPSIS:
+
+  package main;
+  use typesafety;
+
+  # use typesafety 'summary';
+
+  my FooBar $foo :typed; # alternate syntax:    declare FooBar => my $a;
+  my FooBar $bar :typed; # establish type-checked variables
+  my BazQux $baz :typed; # my <type/package> <variable> :typed;
+
+  $foo = new FooBar;     # this is okey, because $foo holds FooBars
+  $bar = $foo;           # this is okey, because $bar also holds FooBars
+  # $foo = 10;           # this would throw an error - 10 is not a FooBar
+  # $baz = $foo;         # not allowed - FooBar isn't a BazQux
+  $foo = $baz;           # is allowed -  BazQux is a FooBar because of inheritance
+  $bar = $foo->foo();    # this is okey, as FooBar::foo() returns FooBars also
+
+  typesafety::check();   # perform type check static analysis
+
+  #
+
+  package FooBar;
+  use typesafety;
+
+  # unneeded - new() defaults to prototype to return same type as package
+  # proto 'new', returns => 'FooBar'; 
+
+  proto 'foo', returns => 'FooBar'; 
+  # proto 'methodname', returns => 'FooBar', takes => 'Type', 'Type', 'Type', undef;
+
+
+  sub new {
+    my $type = shift; $type = ref $type if ref $type;
+    bless [], $type;
+  }
+
+  sub foo { my $me = shift; return $me->new(); } 
+
+  #
+
+  package BazQux;
+  use typesafety;
+  @ISA = 'FooBar';
+
+DESCRIPTION:
+
+Prevents you from mistakenly bathing cats.
+
+Scenarios:
+
+
+* Somewhere between point A and point B, a value stops being what you expect.
+  You start inserting locks of checks to figure out where the value went
+  wrong.
+
+* Sometimes a return value is what you want, but sometimes other things come back,
+  so you have to continiously add checks in the code.
+
+* All objects are basically the same. Things that want an object will take any
+  object and try to deal with it, often by just throwing errors if a given
+  method doesn't exist (->can() returns false). This leads to large
+  numbers of checks, yet no number of checks make you feel confident that you've
+  covered everything that can go wrong.
+
+* You're limited in how large of programs you can write, because you can't
+  keep everything straight after a while. And you're tired of writing
+  checks.
+
+Failure to keep track what kind of data is in a given variable or returned 
+from a given method is an epic source of confusion and frustration during
+debugging. 
+
+Given a ->get_pet() method, you might try to bathe the output. If it always
+a dog during testing, everything is fine, but sooner or later, you're
+going to get a cat, and that can be rather bloody.
+
+Welcome to Type Safety. Type Safety means knowing what kind of data you
+have (atleast in general - it may be a subclass of the type you know
+you have). Because you always know what kind of data it is, you see in
+advance when you try to use something too generic (like a pet) where you
+want something more specific (like a dog, or atleast a pet that implements
+the "washable" interface).
+
+Think of Type Safety as a new kind of variable scoping -
+instead of scoping where the variables can be seen from, you're scoping
+what kind of data they might contain.
+
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+This module requires these other modules and libraries:
+
+  B::Generate
+
+COPYRIGHT AND LICENCE
+
+Distribute under the same terms as Perl itself.
+
+Copyright (C) 2003 Scott Walters, scott@slowass.net
+
