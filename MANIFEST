@@ -3,5 +3,6 @@ Makefile.PL
 MANIFEST
 README
 test.pl
+realtest.pl
 typesafety.pm
 META.yml                                Module meta-data (added by MakeMaker)
