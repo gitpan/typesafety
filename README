@@ -1,7 +1,10 @@
-typesafety version 0.01
+typesafety version 0.03
 =======================
 
 typesafety.pm - compile-time type usage static analysis 
+
+This software is alpha - some things work, it might even be useful, but key things
+are still lacking.
 
 SYNOPSIS:
 
@@ -48,29 +51,13 @@ SYNOPSIS:
   use typesafety;
   @ISA = 'FooBar';
 
+  # other things are checked as well - bless, return.
+  # this documentation is out of date with reguards to the documentation in
+  # the module, but it should give you the general idea.
+
 DESCRIPTION:
 
 Prevents you from mistakenly bathing cats.
-
-Scenarios:
-
-
-* Somewhere between point A and point B, a value stops being what you expect.
-  You start inserting locks of checks to figure out where the value went
-  wrong.
-
-* Sometimes a return value is what you want, but sometimes other things come back,
-  so you have to continiously add checks in the code.
-
-* All objects are basically the same. Things that want an object will take any
-  object and try to deal with it, often by just throwing errors if a given
-  method doesn't exist (->can() returns false). This leads to large
-  numbers of checks, yet no number of checks make you feel confident that you've
-  covered everything that can go wrong.
-
-* You're limited in how large of programs you can write, because you can't
-  keep everything straight after a while. And you're tired of writing
-  checks.
 
 Failure to keep track what kind of data is in a given variable or returned 
 from a given method is an epic source of confusion and frustration during
