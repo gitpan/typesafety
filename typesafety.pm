@@ -2,12 +2,46 @@ package typesafety;
 
 # major outstanding issues - see Bugs in the POD
 
+# o. return statements themselves! how could i forget. this whole project was both more complex
+#    and easier than expected. easier to do individual things but more things to do. in side of
+#    a code block (the loop in check()), if there is a prototype for the code block we're
+#    currently doing, make sure all return statements return something of that type.
+# o. we should propogate expected type up as we recurse, or else make sure that nothing dies
+#    for lack of type data when we're just exploring the tree.
+#    we're already narrowing down offending code to the statement, but propogating the
+#    type information up would narrow it down to the exact place in the expression that
+#    type safety was lost. reporting on the top and bottom would be most useful -
+#    if a method argument is wrong and it comes from an expression, which arg has the
+#    wrong type and at what point in the expression might both be useful. not sure what
+#    i'm going to do with this. $expected in solve_type().
+# o. functions should be prototyped too - package would obviously default to current package.
+# o. types.pm allows method prototypes like sub foo (int $bar, string $baz) - amazing! how? steal!
+# o. we should observe *any* unsafe use of scalars we've defined - that means picking raw padsv's out of
+#    the blue in the bytecode tree, and warning or dieing. likewise, we should descend through any
+#    unknown ops or known ops used on non-type-checked things. should track expected return type, too.
+# o. we must descend into any code references we see defined. they should be pushed onto a 
+#    queue, sort of like %knownuniverse.
+# o. Sub::Parameters integration
+# o. ML-style automatic argument type discerning?
+# o. we typecheck scalars, but what about arrays? should be able to unflatten an array and have it
+#    satisfy the last requirement(s) for a given type. ie, if more than once instance of a given
+#    type appears in a row as the last type in an argument list prototype, we can assume that the
+#    array will take care of it.
 # o. should we clear $scalars between calls to different methods? i think Perl reuses the pad numbers, so yes.
-# o. decypering lists for the padsv on the end still doesn't work. my FooBar $foo :typed = 1; happily runs.
+# o. decyphering lists for the padsv on the end still doesn't work. my FooBar $foo :typed = 1; happily runs.
+# o. just for fun, we should use ourself (or a copy of ourselve) on ourself. we should examplify the code style
+#    we're proposing other people use.
+# o. mangle function names using source filters and do method overloading based on those mangled names?
 
 # major resolved issues:
 
-# v. $a->meth() - $methods{$scalars->{targ of $a}->type()}->{'meth'} should exist, period, or we're trying to
+# v/ implementation badly non-optimal - we scan recursively from each point, but we consider
+#    each and every point! we could recurse like we do, but cache opcode=>type like types.pm,
+#    or possible start to most deeply nested ops and work outwards, but we might miss prototypes etc.
+#    move to tracking return values to and from each seq() number?
+#    or, if we're fully recursive, we could walk the op tree ourselves, just going sibling to sibling
+#    at the top level, recursing into the depths. yeah, i like that. okey, that's what we've done.
+# v/ $a->meth() - $methods{$scalars->{targ of $a}->type()}->{'meth'} should exist, period, or we're trying to
 #    call an unprototyped method.
 # v/ when multiple things are declared on one line, they each still get their own nextstate.
 #    this means we need only process them in the same order. each could link to the next.
@@ -26,10 +60,13 @@ package typesafety;
 #    for now.
 
 use 5.8.0;
-our $VERSION = '0.01';
+use strict;
+no strict 'refs';
+use warnings;
+our $VERSION = '0.02';
+use Carp 'confess';
 
-use attributes;
-use B;
+use B qw( ppname SVf_IOK SVf_NOK SVf_POK SVf_IVisUV OPf_KIDS );
 use B::Generate;
 
 # debugging
@@ -43,11 +80,14 @@ use B::Generate;
 
 # use attributes to flag the desired datatypes. then do simple static analisys, using the B backend.
 
-my $methods;       # $methods->{$package}->{$sub} = ob
-my $scalars;       # $scalars->{$targ} = ob
 my %knownuniverse; # all known namespaces - our inspection list
-my %args;          # use-type arguments
-my $debug;         # debug mode
+my %args;          # use-time arguments
+my $debug = 0;     # debug mode flag
+my $curcv;         # codevalue to get pad entries from
+
+my $lastline; my $lastfile; my $lastpack;  # set from COP statements as we go 
+
+sub nastily () { " in package $lastpack, file $lastfile, line $lastline"; }
 
 #
 # allow user to specify what types ought to be
@@ -71,7 +111,7 @@ sub import {
      }
      (undef, my $filename, my $line) = caller(0); # XX nasty hardcode
      die "filename" unless $filename; die "line" unless $line;
-     $methods->{$caller}->{$method} = get_type_ob($type, $caller, $filename, $line, undef, $method, 'method', $takes);
+     define_method($caller, $method, get_type_ob($type, $caller, $filename, $line, undef, $method, 'method', $takes));
      # print 'debug: ', $methods->{$caller}->{$method}->diagnostics(), "\n"; 
   };
   *{$caller.'::declare'} = sub :lvalue { 
@@ -80,26 +120,86 @@ sub import {
   return 1;
 }
 
-sub MODIFY_SCALAR_ATTRIBUTES {
-  # this, like declare()'s definition above, does nothing when executed, but
-  # generates signiture code in the bytecode tree. it is this signiture that
-  # we recognize and extract information from.
-  return () if $_[2] eq 'typed'; # success
-  return undef;                  # don't know that attribute, sorry
-}
+#
+# data structures
+#
 
-sub get_type_ob {
-  package typesafety::typeob;
-  sub type     { $_[0]->[0] }  # our primary interest - do the types match?
-  sub package  { $_[0]->[1] }  # diagnostic output in case of type match failure
-  sub filename { $_[0]->[2] }  # diagnostics
-  sub line     { $_[0]->[3] }  # diagnostics
-  sub pad      { $_[0]->[4] }  # scalars only 
-  sub name     { $_[0]->[5] }  # scalars only 
-  sub desc     { $_[0]->[6] }  # scalar or method return?
-  sub takes    { $_[0]->[7] }  # in the case of methods, what types (in order) do we take for args?
-  sub diagnostics { sprintf "%s %s, type %s, defined in package %s, file %s, line %d", map { $_[0]->[$_] || '?' } (6, 5, 0, 1, 2, 3) }
-  bless [@_], __PACKAGE__;
+{
+
+  my $methods;       # $methods->{$package}->{$methodname} = typeob
+  my $scalars;       # $scalars->{$targ} = typeob
+
+  sub get_type_ob {
+    # represents a type itself, including where it was defined.
+    # type data associated with a typed scalar - includes verbose information about where the type was defined
+    # for good diagnostics in case of error
+    package typesafety::typeob;
+    sub type     { $_[0]->[0] }  # our primary interest - do the types match?
+    sub package  { $_[0]->[1] }  # diagnostic output in case of type match failure
+    sub filename { $_[0]->[2] }  # diagnostics
+    sub line     { $_[0]->[3] }  # diagnostics
+    sub pad      { $_[0]->[4] }  # scalars only 
+    sub name     { $_[0]->[5] }  # scalars only 
+    sub desc     { $_[0]->[6] }  # scalar or method return?
+    sub takes    { $_[0]->[7] }  # in the case of methods, what types (in order) do we take for args?
+    sub diagnostics { sprintf "%s %s, type %s, defined in package %s, file %s, line %s", map { $_[0]->[$_] || '?' } (6, 5, 0, 1, 2, 3) }
+    bless [@_], __PACKAGE__;
+  }
+  
+  sub lookup_method {
+    my $package = shift;
+    my $method = shift;
+    return exists $methods->{$package} if ! defined $method;
+    return $methods->{$package}->{$method} if exists $methods->{$package} and exists $methods->{$package}->{$method};
+    return undef;
+  }
+  
+  sub define_method {
+    my $package = shift;
+    my $method = shift;
+    my $typeob = shift;
+    $methods->{$package}->{$method} = $typeob;
+  }
+  
+  sub lookup_targ {
+    my $targ = shift;
+    return $scalars->{$targ} if exists $scalars->{$targ};
+    # assume first usage and infer type if possible
+    my $name = (($curcv->PADLIST->ARRAY)[0]->ARRAY)[$targ];  # from B::Concise
+    return unless $name->can('SvSTASH');
+    my $type = $name->SvSTASH->NAME; # perl guts, perl guts, rolly polly perl guts
+    $type && $type ne 'main' or return undef; # 'main' is voodoo
+    $scalars->{$targ} = get_type_ob($type, $lastpack, $lastfile, $lastline, $targ, $name->sv(), 'scalar - first usage');
+    return $scalars->{$targ};
+  }
+  
+  sub nuke_scalars {
+    # XXX should just key scalars on CV
+    $scalars = {};
+  }
+
+  sub summary {
+    # give a nice report of what we did
+    print "typesafety.pm status report:\n";
+    print "----------------------------\n";
+    foreach my $typeob (values %$scalars) {
+      print $typeob->diagnostics(), "\n";
+    }
+  }
+
+  sub get_arg_ob {
+    # represents a place where a type is expected or used.
+    # type data associated with method prototype or an opcode. returned from solve_type(), solve_list_type(), and check_args()
+    # include some information for diagnostics about where this type was used.
+    # XXX if we propoate the expected type, error messages can be given where they are found rather than
+    # trying to return them back in diagnostics - maybe? is everything available? then this could go away
+    # in favor of plain old type obs. no. not enough information is available. 
+    package typesafety::argob;
+    sub typeob      { $_[0]->[0] }
+    sub diagnostics { $_[0]->[1] }
+    bless [ @_ ], __PACKAGE__;
+  }
+
 }
 
 #
@@ -111,60 +211,106 @@ sub get_type_ob {
 # from them. when a pattern is found, we update internal information, or
 # else test internal information to see if something is "safe".
 
-my $curcv; # codevalue to get pad entries from
-
 sub check {
 
   # check the main area first - it may set things up that are in the scope of methods defined later
   $curcv = B::main_cv();
-  B::walkoptree_slow(B::main_root(), 'typesafe', 0); 
+  walkoptree(B::main_root(), \&solve_type, undef); 
 
   # each package that has used us, check them as well
   foreach my $package (keys %knownuniverse) {
-    # print "knownuniverse: ", $package, "\n";
+    # print "knownuniverse: ", $package, "\n" if $debug;
     foreach my $method (grep { defined &{$package.'::'.$_} } keys %{$package.'::'}) {
-      summary();
-      $scalars = {}; # blow away our concept of what pads are associated with what types as we switch pads
+      summary() if(exists $args{summary}); 
+      nuke_scalars(); # blow away our concept of what pads are associated with what types as we switch pads
       next if $method eq 'proto';
       next if $method eq 'declare';
       # print "knownuiverse: method: $method\n";
       my $cv = *{$package.'::'.$method}{CODE};
       $curcv = B::svref_2object($cv);
       B::svref_2object($cv)->ROOT() or die;
-      B::walkoptree_slow(B::svref_2object($cv)->ROOT(), 'typesafe', 0);
+      # return statements out of methods are expected to return a certain type
+      my $expected = lookup_method($package, $method);
+      walkoptree(B::svref_2object($cv)->ROOT(), \&solve_type, $expected);
     }
   }
 
 }
 
-sub summary {
-  if(exists $args{summary}) {
-    # give a nice report of what we did
-    print "typesafety.pm status report:\n";
-    print "----------------------------\n";
-    foreach my $typeob (values %$scalars) {
-      print $typeob->diagnostics(), "\n";
-    }
+#
+# crawl the bytecode tree
+#
+
+sub walkoptree {
+  # experimental - we don't recurse here, we recurse through solve_type(), except in the case of
+  # pmops and anoncodes and such. no, we can't even do those here, or else we'll miss most of them XXX.
+  my $op = shift;
+  my $sub = shift;
+  my @args = @_;
+  for(my $kid = $op->first(); $$kid; $kid = $kid->sibling()) {
+    $debug and print "debug: -------------- ", $kid->name(), ' ', $kid->seq(), "\n";
+    $sub->($kid, @args);
+    # XXX the last thing should be "return" or else somehow unreachable (if/elseif/else, each with
+    # a return as the last thing), and the return value should be consistent with $expected from
+    # check(), above. right now, it would have to be enforced here, which is kind of ugly.
   }
+  # if (B::class($op) eq 'PMOP' && $op->pmreplroot() && ${$op->pmreplroot()}) {
+  #     # pattern-match operators
+  #     walkoptree($op->pmreplroot(), $sub);
+  # }
 }
 
-my $lastline; my $lastfile; my $lastpack; my $lastvarname; 
+#
+# deduce type given an opcode
+#
 
-sub nastily () { "$lastvarname in package $lastpack, file $lastfile, line $lastline"; }
+sub solve_type {
 
-sub B::OP::typesafe {
+  # what type does an expression return? 
 
-  my $self = shift; # op object
+  # this is called for each opcode at the root level of the program, where it recurses
+  # to the depths of that node.
+  # when an assignment is found, this is called for each of the right and left sides.
+  # when a prototyped method call is found, this is called for each argument to that method call.
+  # called and recursively by ourself, and indirectly recursively by ourselves by way of
+  # solve_list_type() and check_args(), which we call.
 
-  my $sassign_okey = 0;
+  # failure dies. 
+  # success returns typesafety::argob object representing the result and the where 
+  # bytetree scanning left off.
+  # success is easily won when no particular type is expected.
+  # XXX - lvalue functions
 
-  # per-op callback. 
-  # this is called once for each opcode in the program.
-  # here, things get ugly. making sense of the perl bytecode tree takes some doing,
-  # and there are several unrelated things we're looking for, making this bulky.
-  # this is the way we read our B, read our B, read our B, so early in the mornin'!
+  my $self = shift;
+  my $expected = shift;
 
-  # print "debug: ", $self->name(), "\n";
+  #
+  # simple and recursive
+  #
+
+  # null - ops that were optimized away
+
+  if(! $self->can('name') or
+     $self->isa('B::NULL') or
+     $self->name() eq 'null'
+     # confess! confess! confess!
+  ) {
+    $debug and print "debug: ", __LINE__, ": null type: ppname: ", 
+                     $self->can('targ') ? ppname($self->targ()) : 'unknown', "\n";
+
+    if($self->can('targ') and
+       $self->flags & OPf_KIDS and
+       $self->first() and
+       $self->first()->sibling() 
+    ) {
+       # ! $self->first()->isa('B::NULL') and
+       # ! $self->first()->sibling()->isa('B::NULL') 
+      return solve_type($self->first()->sibling(), $expected);
+    }
+    return get_arg_ob(undef, 'very unknown construct');
+  }
+
+  # nextstate
 
   # 2     <;> nextstate(main 494 test.pl:32) v ->3
 
@@ -177,149 +323,83 @@ sub B::OP::typesafe {
     $lastfile = $self->file();
     $lastline = $self->line();
 
+    $debug and print "debug: ", join ' ', '-' x 20, $lastline, $lastfile, $lastpack, '-' x 20, "\n";
+
   }
 
-  # declare FooBar => my $test3;
-
-  # l  <;> nextstate(main 581 test.3.pl:25) v
-  # m  <0> pushmark s
-  # n  <$> const(PV "FooBar") sM/BARE
-  # o  <0> padsv[$test3:581,582] lM/LVINTRO
-  # p  <$> gv(*declare) s
-  # q  <1> entersub[t5] vKS/TARG,1
-  # r  <;> nextstate(main 582 test.3.pl:27) v
-
-  if($self->name() eq 'pushmark') {
-    # go on the lookout for type checked variable definitions
-    # we record the pad and name of variables defined using our little type specifying idiom
-    # this is needed so that we can relate pad information to name/package/type/etc
-    my $op = $self;
-    my $pad; my $type; 
-    # print "debug: entersub - looking for pad info for declare() syntax - going in, line $lastline...\n";
-    foreach my $test (
-      sub { $op->name() eq 'pushmark' },
-      sub { $op->name() eq 'const' and $type = $op->sv()->sv()  },           # "FooBar" - type information
-      sub { $op->name() eq 'padsv' and $pad = $op->targ()  },  
-      sub { $op->name() eq 'gv' and ($op->sv()->sv() eq 'declare' or $op->sv()->sv() =~ m/::declare$/) }, # "declare"
-      sub { return unless $op->name() eq 'entersub'; associate_scalar($pad, $type);  },
-    ) {
-      # print "debug: looking for pad info: considering: ", $op->name(), "\n";
-      last unless $test->(); 
-      $op = $op->next() or last; # doing next() on purpose, not sibling()
-    }
-  }
-
-  # my FooBar $foo :typed;
-
-  # 2  <;> nextstate(main 514 test.pl:32) v
-  # 3  <0> pushmark v
-  # 4  <0> pushmark s
-  # 5  <$> const(PV "attributes") sM      --- we start scanning here
-  # 6  <$> const(PV "FooBar") sM
-  # 7  <0> padsv[$foo:514,516] sRM
-  # 8  <1> srefgen sKM/1
-  # 9  <$> const(PV "typed") sM
-  # a  <$> method_named(PVIV 1878035063) 
-  # b  <1> entersub[t2] vKS*/DREFSV       --- and stop here
-  # c  <0> padsv[$foo:514,516] vM/LVINTRO
-  # d  <@> list vK/128
+  # const
 
   if($self->name() eq 'const') {
-    # go on the lookout for type checked variable definitions
-    # we record the pad and name of variables defined using our little type specifying idiom
-    # this is needed so that we can relate pad information to name/package/type/etc
-    my $op = $self;
-    my $pad; my $type; 
-    # print "debug: entersub - looking for pad info for my() syntax - going in, line $lastline...\n";
-    foreach my $test (
-      sub { $op->name() eq 'const' and $op->sv()->sv() eq 'attributes'  },   # "attributes"
-      sub { $op->name() eq 'const' and $type = $op->sv()->sv()  },           # "FooBar" - type information
-      sub { $op->name() eq 'padsv' and $pad = $op->targ()  },  
-      sub { $op->name() eq 'srefgen' },
-      sub { $op->name() eq 'const' and $op->sv()->sv() eq 'typed'  },        # "typed" - attribute name
-      sub { $op->name() eq 'method_named' },
-      sub { return unless $op->name() eq 'entersub'; associate_scalar($pad, $type); },
-    ) {
-       # print "debug: considering: looking for pad info: ", $op->name(), "\n";
-       last unless $test->(); 
-       $op = $op->next() or last; # using next() here, not sibling(), on purpose 
-    }
+    # very simple case
+    print "debug: const\n" if $debug;
+    return get_arg_ob(undef, "constant value: '" . $self->sv()->sv() . "'");
   }
 
-  #
-  # actual type checks 
-  #
-
-  # $foo->foo(1, 2, 3);
-
-  # 1d <;> nextstate(main 513 test.7.pl:29) v
-  # 1e <0> pushmark s
-  # 1f <0> padsv[$foo:511,513] sM
-  # 1g <$> const(IV 1) sM
-  # 1h <$> const(IV 2) sM
-  # 1i <$> const(IV 3) sM
-  # 1j <$> method_named(PVIV "foo") 
-  # 1k <1> entersub[t8] vKS/TARG
-  # 1l <;> nextstate(main 513 test.7.pl:33) v
-
-  if($self->name() eq 'pushmark') {
-    # don't allow method calls on typechecked objects unless that method is prototyped.
-    # this is more than a little redundant with the $x=$y->z() below in solve_types(). XX
-    my $op = $self->next();
-    my $targ; 
-    my $method;
-    my $argop;
-    # print "debug: method call check, line $lastline...\n";
-    foreach my $test (
-      sub { $op->name() eq 'padsv' and $targ = $op->targ()  },  
-      sub { 
-        while($op and $op->name() eq 'const') {
-           $argop ||= $op;
-           $op = $op->next() 
-        }
-        return if !$op or $op->name() ne 'method_named';
-        $method = $op->sv()->sv();
-      },
-      sub { $op->name() eq 'entersub' },
-    ) {
-       # print "debug: considering: ", $op->name(), "\n";
-       last unless $test->(); 
-       $op = $op->next(); # using next() here, not sibling(), on purpose 
-    }
-
-    if(defined $targ and exists $scalars->{$targ} and defined $method) {
-      # this lexical isn't type checked and we're not assigning the result. if $scalars->{$targ} doesn't exist, fine.
-      my $type = $scalars->{$targ}->type() or die nastily;          # $a, from "$a->bar()"
-      exists $methods->{$type} or die 'unknown package: ' . $type . ' ' . nastily;
-      check_args($argop, $type, $method);
-    }
-
+  if($self->name() eq 'padsv') {
+    # simple case
+    # $debug and print "debug: ", __LINE__, ": padsv\n";
+    # this happens when we see non-typesafe scalars, which we tolerate ;)
+    lookup_targ($self->targ()) or return
+      get_arg_ob(undef, "non-type-checked scalar: '" . lexicalname($self->targ()) . '"');
+    return get_arg_ob(lookup_targ($self->targ()), lookup_targ($self->targ())->type() . " typed scalar value");
   }
 
-  if($self->name() eq 'sassign') {{
+  # list
 
-    # print "considering sassign at line $lastline\n";
+  if($self->name() eq 'list') {
+    # general case - we have a list type, which is the GCD of all types in the list
+    # a whole class of problems, really. an sassign is being done to the lvalue result of a list.
+    # that lvalue result could be a type-checked variable used in a substr() or other lvalue
+    # built in, or it could be a declaration being assigned to right off, perhaps from a 
+    # constructor. 
+    # solve_types() should be able to go into a list and figure out which type checked scalar (if any)
+    # is the fall through value. in order to do this, we'd have to track what arguments go into and
+    # come out of each op, and then when the block ends, remember which op was the last. 
+    return solve_list_type($self->first()); 
+  }
+
+  # sassign
+  # aassign
+
+  if($self->name() eq 'sassign' or
+     $self->name() eq 'aassign') {{
+
+    $debug and print 'debug: ', __LINE__, ": considering ", $self->name(), " at line $lastline\n";
 
     # the left hand side is what is being assigned to. if it isn't type-checked,
     # then type checking isn't in effect on this statement.
     # this refers to the side of the assign operator being applied to us.
 
-    my $leftob = solve_type($self->last()); my $left = $leftob->typeob(); last unless $left;
+    # in case of aassign (array assign, one list is assigned to another):
+    # instead of calling solve_list_type() as might make sense, we instead just call
+    # solve_type(), as either of the lists may have been optimized away, and solve_type()
+    # handles this general case, kicking over to solve_list_type() as needed.
 
-    my $rightob = solve_type($self->first()); my $right = $rightob->typeob();
+    my $leftob = solve_type($self->last(), $expected); my $left = $leftob->typeob(); 
 
-    $rightob->typeob() or die 'unsafe assignment: ' . $left->diagnostics() . ' cannot hold ' . $rightob->diagnostics() . ' ' . nastily;
+    $debug and print "debug: left type: ", $left ? $left->type() : 'unknown', ' ',
+                     'diagnostics: ', $leftob->diagnostics(), 
+                     ' opname: ', $self->last()->name(), ' ',
+                     " at line $lastline.\n";
 
-    # print "debug: left type: ", $left->type(), " at line $lastline. right type: ", $right->type(), "\n";
-    
+    my $rightob = solve_type($self->first(), $expected); my $right = $rightob->typeob();
+
+    $debug and print "debug: right type: ", $right ? $right->type() : 'unknown', ' ',
+                     'diagnostics: ', $rightob->diagnostics(), 
+                     ' opname: ', $self->first()->name(), ' ',
+                     " at line $lastline.\n";
+
+    return $rightob if ! $left;
+
+    $rightob->typeob() or die 'unsafe assignment: ' . $left->diagnostics() . 
+                              ' cannot hold ' . $rightob->diagnostics() . ' ' . nastily;
+
     # do type match exactly? 
-
-    last if $right->type() eq $left->type();
+    return $left if $right->type() eq $left->type();
 
     # is the thing on the right a subtype of the variable meant to hold it?
     # this uses softrefs to call ->isa() on a string. the string represents the type.
-
-    last if $right->type()->isa($left->type());
+    return $left if $right->type()->isa($left->type());
 
     # can't prove it to be safe. sorry.
 
@@ -327,70 +407,35 @@ sub B::OP::typesafe {
 
   }}
 
-}
+  #
+  # return: a unique case
+  #
 
-sub associate_scalar {
+  # return 1, 2, 3, 4;
 
-    # found one of our scalar initialization constructs.
-    # called from B::OP::typesafe.
-    # we recognize the code, and we're going to try to recognize the line number and filename.
-    # if we can do so, we have enough information to associate a type (and everything else in
-    # a typeob) with a pad entry number.
-    # yes, this is cheezy and dangerous. my first idea didn't work out.
+  # 8     <@> return K ->9
+  # 3        <0> pushmark s ->4
+  # 4        <$> const(IV 1) s ->5
+  # 5        <$> const(IV 2) s ->6
+  # 6        <$> const(IV 3) s ->7
+  # 7        <$> const(IV 4) s ->8
 
-    # this assumes that a unique pad slot exists for each variable. i haven't tested this
-    # idea heavily. things might depend on other context information. i may have to come
-    # back and fix this.
-
-    my $pad = shift;   # pad slot number
-    my $type = shift;  # litteral name of the type
-
-    exists $scalars->{$pad} and 
-      die lexicalname($pad) . ' already defined: first declaration: ' . $scalars->{$pad}->diagnostics() . ' ' . 
-          ' second declaration: ' . nastily;
-
-    $scalars->{$pad} = get_type_ob($type, $lastpack, $lastfile, $lastline, $pad, lexicalname($pad), 'variable');
-    # print "debug: success - found pad of variable ", $scalars->{$pad}->name(), " - pad $pad, at file $lastfile line $lastline\n";
-}
-
-sub get_arg_ob {
-  package typesafety::argob;
-  sub typeob      { $_[0]->[0] }
-  sub lastop      { $_[0]->[1] }
-  sub diagnostics { $_[0]->[2] }
-  bless [ @_ ], __PACKAGE__;
-}
-
-sub solve_type {
-
-  # when an assignment is found, this is called for each of the right and left sides.
-  # called from B::OP::typesafe and recursively by ourself.
-  # solving argument types means finding the targ, which is the pad slot, and 
-  # looking that up in $scalars, if possible. failure returns undef or just dies. 
-  # returns typesafety::argob object representing the result and the where 
-  # bytetree scanning left off.
-
-  my $self = shift;
-
-  if($self->name() eq 'const') {
-    print "debug: const\n" if $debug;
-    return get_arg_ob(undef, $self, "constant value: '" . $self->sv()->sv() . "'");
+  if($self->name() eq 'return') {
+    # the pushmark seems to always be there - even on an empty return. 
+    # individual items in the list vary, of course.
+    my $return = solve_list_type($self->first()->sibling());
+    return $return unless $expected;
+    die "returning from method, " . $expected->diagnostics() . ' expected, instead, we get a lousy ' .
+        $return->diagnostics() if ! $return->type() or ! $return->type()->isa($expected->type());
   }
 
-  if($self->name() eq 'padsv') {
-    # simple case
-    print "debug: padsv\n" if $debug;
-    # this happens when we see non-typesafe scalars, which we tolerate ;)
-    # print "debug: no typeob entry for this pad! ", $self->targ(), ' ', 
-    #   lexicalname($self->targ()), " line $lastline\n" unless exists $scalars->{$self->targ()};
-    exists $scalars->{$self->targ()} or return 
-      get_arg_ob(undef, $self, "non-type-checked scalar: '" . lexicalname($self->targ()) . '"');
-    return get_arg_ob($scalars->{$self->targ()}, $self, "success");
-  }
+  #
+  # real code and constructs
+  #
 
-  # my $a = bar->new();
+  # bar->new();
 
-  # b     <2> sassign vKS/2 ->c
+  # b     <2> sassign vKS/2 ->c                     <--- or other stuff
   # 9        <1> entersub[t2] sKS/TARG ->a          <--- this is the node passed to us in this case
   # 3           <0> pushmark s ->4
   # 4           <$> const(PV "bar") sM/BARE ->5
@@ -405,17 +450,20 @@ sub solve_type {
      # is it a constructor call? those are self-typing. abstract factories shouldn't use
      # constructors for their dirty work.
 
-     print "debug: entersub (constructor?), line $lastline\n" if $debug;
+     # print "debug: entersub (constructor?), line $lastline\n" if $debug;
 
      my $op = $self->first();
      my $type;
      my $success = 0;
+     my $argop;
+
      foreach my $test (
        sub { $op->name() eq 'pushmark' },
        sub { return unless $op->name() eq 'const'; $type = $op->sv()->sv(); return 1; },
        sub {
+         $argop = $op;
          while($op and $op->name() ne 'method_named') {
-           # seek past method call arguments. in the future, we would type check those. XX.
+           # seek past method call arguments but remember the opcode of the first argument.
            $op = $op->sibling();
          }
          return unless $op; 
@@ -433,172 +481,78 @@ sub solve_type {
 
   }
 
-  # $b = $a->bar();
+  # $a->bar();
 
   # this one is tricky. we have to get $a's type to get bar's package to see if that matches $b's type.
 
-  # m     <2> sassign vKS/2 ->n
   # k        <1> entersub[t4] sKS/TARG ->l       <--- this node is the one given to us
   # c           <0> pushmark s ->d
-  # d           <0> padsv[$a:3,5] sM ->e
+  # d           <0> padsv[$a:3,5] sM ->e         .... may not be a padsv - should use solve_type()!
   # e           <$> const(IV 5) sM ->f           <--- from here until we hit the method_named op,
-  # f           <$> const(IV 4) sM ->g                we these are processed by arg_types() for type safety. 
+  # f           <$> const(IV 4) sM ->g                we these are processed by check_args() for type safety. 
   # g           <$> const(IV 3) sM ->h                the first argument gets held by $argop.
   # h           <$> const(IV 2) sM ->i
   # i           <$> const(IV 1) sM ->j
   # j           <$> method_named(PVIV "bar") s ->k
-  # l        <0> padsv[$b:4,5] sRM* ->m
 
   if($self->name() eq 'entersub') {
 
-     print "debug: entersub (method call on typed object)\n" if $debug;
+     # print "debug: entersub (method call on typed object)\n" if $debug;
 
      my $op = $self->first();
-     my $method;   # bar, in "$b = $a->bar()"
-     my $targ;     # $a, in "$b = $a->bar()", gets us this from its typeob
+     my $method;   # bar, in "$a->bar()"
+     my $targ;     # $a, in "$a->bar()", gets us this from its typeob
      my $success = 0;
      my $argop;    # pointer to opcode representing first argument
 
      foreach my $test (
        sub { $op->name() eq 'pushmark' },
        sub { return unless $op->name() eq 'padsv'; $targ = $op->targ(); return 1; }, 
+           # XXX - instead of just a targ holding the object ref, this could be an expression! XXX recurse
        sub { 
+         $argop = $op;
          while($op and $op->name() ne 'method_named') {
-           # seek past method call arguments. this is where we would check arguments types, too.
-           $argop ||= $op;
            $op = $op->sibling();
          }
-         return unless $op; 
+         return unless $op and $op->name() eq 'method_named'; 
          $method = $op->sv()->sv();                               # bar, in "$b = $a->bar()"
          $success = 1;
        },
      ) {
-       # print "debug: considering: ", $op->name(), "\n";
+       # print "debug: ", __LINE__, ": considering: ", $op->name(), "\n";
        last unless $test->(); 
        $op = $op->sibling() or last;
      }
 
      if($success) {
 
-       exists $scalars->{$targ} or die 'missing type information for ' . lexicalname($targ) . ' ' . nastily;
-       my $type = $scalars->{$targ}->type() or die nastily;          # $a, from "$b = $a->bar()"
-       exists $methods->{$type} or die 'unknown package: ' . $type . ' ' . nastily;
-
-       return check_args($argop, $type, $method);
+       if(! lookup_targ($targ)) {
+          confess 'missing type information for ' . lexicalname($targ) . 
+                  " in expression that should return $expected " . nastily if $expected;
+       } else {
+         my $type = lookup_targ($targ)->type() or die nastily;          # $a, from "$b = $a->bar()"
+         lookup_method($type) or die 'unknown package: ' . $type . ' ' . nastily;
+         return check_args($argop, $type, $method);
+       }
 
      }
 
   }
 
-  # my FooBar $bar :typed = 1 and any number of other compound constructs
+  #
+  # nothing we recognize. we're going to return "unknown", but first we should make sure
+  # that expressions nested under this point get inspected for type safety. so, we 
+  # recurse, expecting nothing.
+  # 
 
-  # a whole class of problems, really. an sassign is being done to the lvalue result of a list.
-  # that lvalue result could be a type-checked variable used in a substr() or other lvalue
-  # built in, or it could be a declaration being assigned to right off, perhaps from a 
-  # constructor. XXX
-  # if we find an sassign, we oughtta just attempt to solve the left and right hand sides
-  # of it in generic, seperate ways, rather than trying to fit each combination into
-  # a seperate framework.
-
-  # r     <2> sassign vKS/2 ->s
-  # f        <$> const(IV 1) s ->g
-  # q        <@> list sKRM*/128 ->r
-  # g           <0> pushmark vRM* ->h
-  # o           <1> entersub[t4] vKS*/DREFSV ->p
-  # h              <0> pushmark s ->i
-  # i              <$> const(PV "attributes") sM ->j
-  # j              <$> const(PV "FooBar") sM ->k
-  # l              <1> srefgen sKM/1 ->m
-  # -                 <1> ex-list lKRM ->l
-  # k                    <0> padsv[$bar:493,494] sRM ->l
-  # m              <$> const(PV "typed") sM ->n
-  # n              <$> method_named(PVIV 1878035063) ->o
-  # p           <0> padsv[$bar:493,494] sRM*/LVINTRO ->q
-
-  # z  <;> nextstate(main 530 test.7.pl:34) v
-  # 10 <$> const(IV 1) s
-  # 11 <0> pushmark vRM*
-  # 12 <0> pushmark s
-  # 13 <$> const(PV "attributes") sM
-  # 14 <$> const(PV "FooBar") sM
-  # 15 <0> padsv[$bar:530,532] sRM
-  # 16 <1> srefgen sKM/1
-  # 17 <$> const(PV "typed") sM
-  # 18 <$> method_named(PVIV 1878035063) 
-  # 19 <1> entersub[t7] vKS*/DREFSV
-  # 1a <0> padsv[$bar:530,532] sRM*/LVINTRO
-  # 1b <@> list sKRM*/128
-  # 1c <2> sassign vKS/2
-  # 1d <;> nextstate(main 531 test.7.pl:36) v
-
-  # XXX this doesn't work - $targ doesn't represent a known typeob - because
-  # our parser hasn't made it there yet! we're too early. have to add "when defined" hooks
-  # onto types - a sub reference to be executed when they are finally defined, to go
-  # back and investigate the last use of that type, should it be defined. this would
-  # need to go into a seperate hash or muck up a lot of "if $scalars->{x}" tests.
-
-  if($self->name() eq 'list' and
-     $self->last()->name() eq 'padsv' 
-  ) {
-    print "debug: list/padsv\n" if $debug;
-    my $targ = $self->last()->targ();
-    return get_arg_ob($scalars->{$targ}, $op, 'okey') if exists $scalars->{$targ};
-    print "debug: list/padsv: undef - targ: $targ name: ", lexicalname($targ), "\n" if $debug;
-    get_arg_ob(undef, $self, "non-type-checked scalar: '" . lexicalname($targ) . '"');
-  }
-
-  return get_arg_ob(undef, $self, 'unrecognized construct');
-
-}
-
-sub arg_types {
-
-  # method call arguments get checked for types too! woot!
-  # given a list of parameter types and a pointer to an op in a bytecode stream, return undef
-  # for success or an error message if there is a type mismatch between the two.
-
-  my $prot = shift;
-  my $op = shift;
-
-  if(!$op and scalar(@$prot)) {
-    return "arguments were expected, but none were provided. ";
-  }
-
-  # sub { return unless $op->name() eq 'const'; $type = $op->sv()->sv(); return 1; },
-
-  my $index = 0;
-  my $left;
-  my $rightob; my $right;
-
-  while($op and $op->name() ne 'method_named') {
-
-    return "more parameters passed than expected in prototype. "  if ! exists $prot->[$i];
-    # print "debug: considering: ", $op->name(), "\n";
-
-    $left = $prot->[$index];
-    goto OKEY unless $left;
-
-    $right = undef;
-
-    $rightob = solve_type($op); $right = $rightob->typeob();
-    if($left and ! $right) {
-      return "argument number " . ($index + 1) . " must be type '$left' according to prototype. " . $rightob->diagnostics();
+  if($self->flags() & OPf_KIDS) {
+    # this should work for unops, binops, *and* listops
+    for(my $kid = $self->first(); $$kid; $kid = $kid->sibling()) {
+      solve_type($kid, $expected);
     }
-
-    # right->isa(left)
-    goto OKEY if $right->type() eq $left;
-    goto OKEY if $right->type()->isa($left);
-    return "argument number " . ($index + 1) . " type mismatch: must be type '$left'. "; 
-
-    OKEY:
-    $op = $op->sibling() or last;
-    $index++;
-
   }
 
-  return "insufficient number of paramenters. " if $index < @$prot;
-
-  return 0; # success
+  return get_arg_ob(undef, 'unrecognized construct');
 
 }
 
@@ -608,6 +562,9 @@ sub check_args {
   # we check the arguments to that method call against the methods prototype.
   # we also make sure that that method has a prototype, is a constructor, or else the
   # method appears in the package via can(), since we don't want to compute inheritance manually.
+  # XXX if we can track down the package where it is defined, we might find a prototype there
+  # we die if the prototype doesn't match the actual types of the chain of ops.
+  # in case of a match, we return the argob representing the prototype of this function.
 
   my $op = shift;
   my $type = shift;
@@ -615,29 +572,148 @@ sub check_args {
 
   # no $op means no arguments were found. this might be what the prototype is looking for! is this safe? XXX
 
+  # $debug && ! $op and print "debug: ", __LINE__, " check_args called without an OP! type: $type method: $method\n";
+  # $debug && $op and print "debug: ", __LINE__, ": check_args called: op: ", $op->name(), ' ', $op->seq(), 
+  #                         " type: $type method: $method\n";
+
   my $argob;
-  $argob = get_arg_ob($methods->{$type}->{$method}, $op, 'okey') if exists $methods->{$type}->{$method}; 
+
+  # default case - method is prototyped in the package specified by type
+  $argob = get_arg_ob(lookup_method($type, $method), 'okey') if lookup_method($type, $method);
+
   # if method is 'new' and no type exists, default to the type of the reference
-  $argob = get_arg_ob(get_type_ob($type, $type, 'unknown', 0, undef, 'new', 'constructor method'), $op, 'okey') if $method eq 'new';
+  if($method eq 'new' and ! $argob) {
+    $argob = get_arg_ob(get_type_ob($type, $type, 'unknown', 0, undef, 'new', 'constructor method'), 'okey') 
+  }
+
   # kludge, but inheritance doesn't work otherwise!
-  $argob = get_arg_ob(get_type_ob($type, $type, 'unknown', 0, undef, $method, 'inherited/unprototyped method'), $op, 'okey') 
-    if $type->can($method); 
+  if(! $argob and $type->can($method)) {
+    $argob = get_arg_ob(get_type_ob($type, $type, 'unknown', 0, undef, $method, 'inherited/unprototyped method'), 'okey') 
+  }
+
   $argob or die "unknown method. methods called on type safe objects " .
                  "must be prototyped with proto(). package: " . $type . ' method: ' . $method . ' ' . nastily;
 
   # at this point, we know the return type of the method call. now, we check the argument signiture, if there is one.
-  # if we cooked up our own because new() wasn't prototyped, then there won't be one. thats okey.
+  # if we cooked up our own because new() wasn't prototyped, then there won't be one. that's okey.
 
   my $takes = $argob->typeob()->takes();
-  if($takes) {
-    my $err = arg_types($takes, $argop);
-    die $err . " calling $method in $type, " . nastily if $err;
+
+  unless($takes and @$takes) {
+    # this method's arguments aren't prototyped
+    # success, so far. this is this being assigned to something else, that might conflict.
+    # $debug and print "debug: ", __LINE__, ": no 'takes' information found for the type '$type'\n";
+    return $argob; 
   }
 
-  # success, so far. this is this being assigned to something else, that might conflict.
-  return $argob; 
+  # method call arguments get checked for types too! woot!
+  # given a list of parameter types and a pointer to an op in a bytecode stream, return undef
+  # for success or an error message if there is a type mismatch between the two.
+
+  if(!$argob and scalar(@$takes)) {
+    die "arguments were expected, but none were provided, calling $method in $type, " . nastily;
+  }
+
+  my $index = 0;
+  my $leftop = $op; my $left;
+  my $rightargob; my $righttypeob;
+
+  while($leftop and $leftop->name() ne 'method_named') {
+
+    if(! exists $takes->[$index]) {
+      die "more parameters passed than specified in prototype. calling $method in $type, " . nastily;
+    }
+
+    # $debug and print "debug: ", __LINE__, ": checking prototype: considering: ", $leftop->name(), "\n";
+
+    $left = $takes->[$index];
+    goto OKEY if ! $left;
+
+    $rightargob = solve_type($leftop, $left); $righttypeob = $rightargob->typeob();
+
+    if($left and ! $righttypeob) {
+      die "argument number " . ($index + 1) . " must be type $left according to prototype. " . 
+           'instead, it is a(n) ' . $rightargob->diagnostics() . nastily;
+    }
+
+    # righttypeob->isa(left)
+    goto OKEY if $righttypeob->type() eq $left;
+    goto OKEY if $righttypeob->type()->isa($left);
+    die "argument number " . ($index + 1) . " type mismatch: must be type '$left', instead we got a(n) " .
+        $righttypeob->type() . ' ' . nastily; 
+
+    OKEY:
+    $leftop = $leftop->sibling() or last;
+    $index++;
+
+  }
+
+  if($index < @$takes) {
+    die "insufficient number of paramenters - only got " . ($index + 1) . ", expecting " . ((scalar @$takes) + 1) . ' .' .
+        nastily;
+  }
+
+  return $argob; # success
 
 }
+
+#
+# stolen from types.pm by Auther Bergman, then hacked into worthlessness
+#
+
+# part of the effort to merge types.pm and typesafety.pm
+
+sub solve_list_type {
+
+    # a 'list' op was found - any number of things could be littered onto the stack.
+    # this calculates the largest common type of those objects, if any. yes, this means
+    # arrays can't contain mixed information - they're an array of one kind of object
+    # or integers or floats or something. 
+    # the first sibling under list is passed in.
+    # this is called from solve_type(), and itself calls solve_type().
+    # was get_list_proto().
+
+    my $op = shift;
+
+    my @types;
+
+    # return get_arg_ob(undef, "not yet implemented");
+
+    while(ref($op) ne 'B::NULL') {
+        push @types, solve_type($op, undef);
+        $op = $op->sibling();
+    }
+
+    # which object, if any, encapsulates all of the others?
+    # if there are several, they must all be the same class, right?
+    # if there are none, there is no common type to this list!
+
+    my @encapsulates;
+
+    OUTTER: 
+    foreach my $outter (@types) {
+     
+      foreach my $inner (@types) {
+        next unless $inner->typeob();
+        next OUTTER unless $outter->typeob();
+        next OUTTER unless $outter->typeob() eq $inner->typeob() or $outter->typeob()->isa($inner->typeob());
+      }
+      push @encapsulates, $outter;
+    }
+
+    $debug and print "debug: ", __LINE__, ": aren't we clever? we think we know the greatest common type, ",
+                     "and that is: ", @encapsulates && $encapsulates[0]->typeob() ? $encapsulates[0]->typeob()->type() : ' NONE', "! so there ya have it, folks.\n";
+
+    return get_arg_ob(undef, "no common type in list") if ! @encapsulates;
+    return get_arg_ob($encapsulates[0], "list common type"); # XXX this ain't right. okey, why not? 
+    
+}
+
+#
+# utility methods
+#
+
+# these just factor out some of the cruftier syntax
 
 sub lexicalname {
   # given a pad number (stored in all perl operators as $op->targ()), return its name.
@@ -646,6 +722,10 @@ sub lexicalname {
   # which is the correct thing to do with pad entries (length info is barrowed for something else).
   my $targ = shift;
   my $padname = (($curcv->PADLIST->ARRAY)[0]->ARRAY)[$targ];  # from B::Concise
+
+  # print "debug: ", $padname->SvSTASH->NAME, "\n"; # XXX - avoid requirement for :typed if we want!
+  # print "debug: ", $padname->PV, "\n";
+
   return 'SPECIAL' if B::class($padname) eq 'SPECIAL';
   return $padname->PVX(); 
 }
@@ -672,9 +752,9 @@ typesafety.pm - compile-time type usage static analysis
 
   # use typesafety 'summary';
 
-  my FooBar $foo :typed; # alternate syntax:    declare FooBar => my $a;
-  my FooBar $bar :typed; # establish type-checked variables
-  my BazQux $baz :typed; # my <type/package> <variable> :typed;
+  my FooBar $foo;        # establish type-checked variables
+  my FooBar $bar;        # FooBar is the base class of references $bar will hold
+  my BazQux $baz;
 
   $foo = new FooBar;     # this is okey, because $foo holds FooBars
   $bar = $foo;           # this is okey, because $bar also holds FooBars
@@ -694,6 +774,7 @@ typesafety.pm - compile-time type usage static analysis
   # proto 'new', returns => 'FooBar'; 
 
   proto 'foo', returns => 'FooBar'; 
+
   # proto 'methodname', returns => 'FooBar', takes => 'Type', 'Type', 'Type';
 
 
@@ -736,6 +817,19 @@ Scenarios:
       checks.
 
 =back
+
+  This is a SNAPSHOT release of ALPHA software. This is the second snapshot.
+  The first was ugly, ugly, ugly and contained horrific bugs and the implementation
+  was lacking. Much remains to be done and much is in progress, but I can't
+  stand the thought of anyone looking at the original code. Return types
+  still need to be checked. The first one went out the door with a bug
+  that kept method parameters from being checked - this is fixed. There are
+  tests, but they aren't automated yet. It always just succeds if it compiles.
+  The interface has changed and this documentation is wrong - variables
+  should no longer be declared with the :typed attribute attached to them,
+  and the alternate syntax is no longer supported. Early support for 
+  lists are in - lists are considered to be of the type of the common
+  type of all elements.
 
 Failure to keep track what kind of data is in a given variable or returned 
 from a given method is an epic source of confusion and frustration during
@@ -970,9 +1064,17 @@ Some things just plain might not work as described. Let me know.
 L<http://perldesignpatterns.com/?TypeSafety> - look for updated documentation
 on this module here - this doc is kind of sparse.
 
-L<http://www.c2.com/cgi/wiki?NoseJobRefactoring>
+L<types>, by Arthur Bergman - C style type checking on strings, integers,
+and floats. 
+
+L<http://www.c2.com/cgi/wiki?NoseJobRefactoring> - an extreme case of the
+utility of strong types.
 
 L<Class::Contract>, by Damian Conway
+
+L<Attribute::Types>, by Damian Conway
+
+L<Sub::Parameters>, by Richard Clamp
 
 L<Object::PerlDesignPatterns>, by myself. 
 
@@ -990,6 +1092,41 @@ Distribute under the same terms as Perl itself.
 =cut
 
 __END__
+
+  # my FooBar $bar :typed = 1 and any number of other compound constructs
+
+  # r     <2> sassign vKS/2 ->s
+  # f        <$> const(IV 1) s ->g                   <-- assign from
+  # q        <@> list sKRM*/128 ->r                  <-- assigned to
+  # g           <0> pushmark vRM* ->h                     <-- what targ ultimately falls through?
+  # o           <1> entersub[t4] vKS*/DREFSV ->p
+  # h              <0> pushmark s ->i
+  # i              <$> const(PV "attributes") sM ->j
+  # j              <$> const(PV "FooBar") sM ->k
+  # l              <1> srefgen sKM/1 ->m
+  # -                 <1> ex-list lKRM ->l
+  # k                    <0> padsv[$bar:493,494] sRM ->l
+  # m              <$> const(PV "typed") sM ->n
+  # n              <$> method_named(PVIV 1878035063) ->o
+  # p           <0> padsv[$bar:493,494] sRM*/LVINTRO ->q  <-- okey, kind of an obvious question in this case
+
+  # XXX this doesn't work - $targ doesn't represent a known typeob - because
+  # our parser hasn't made it there yet! we're too early. have to add "when defined" hooks
+  # onto types - a sub reference to be executed when they are finally defined, to go
+  # back and investigate the last use of that type, should it be defined. this would
+  # need to go into a seperate hash or muck up a lot of "if $scalars->{x}" tests.
+
+  if($self->name() eq 'list' and
+     $self->last()->name() eq 'padsv' 
+  ) {
+    print "debug: list/padsv\n" if $debug;
+    my $targ = $self->last()->targ();
+    return get_arg_ob(lookup_targ($targ), 'okey') if lookup_targ($targ);
+    print "debug: list/padsv: undef - targ: $targ name: ", lexicalname($targ), "\n" if $debug;
+    get_arg_ob(undef, "non-type-checked scalar: '" . lexicalname($targ) . '"');
+  }
+
+----------
 
 we have to watch for the initial declaration of a variable, so that we can
 associate its pad slot (targ) with the little data container object we
@@ -1028,21 +1165,18 @@ z        <0> padsv[$bar:193,194] sRM* ->10
 
 ------------
 
-okey, the old remember-the-reference-passed-through-attributes-and-look-for-it-in-the-symbol-table
-trick isn't going to work. perl creates scalars on the fly and populates them with information
-from different places. too many temproraries. would have to use globals - yuck. 
+Oh. SVs know what stash they're in. Very very handy!
 
-the reference we get is essentially useless to us. at check time, all scalars 
-point to undef, which they share an instance of, so we can't compare what value
-they initially point at. we can't match actual variables as those are created on the
-fly when padsv runs. 
-
-have to do pure static analysis and forget or downplay attributes.
-
-one working idea: use file/line number information. dangerous, kludgey. record file/line from
-caller() when attributes are registered, along with the required type. at check time,
-we just have to check what is being assigned based on line/file from nextstate.
-
+    if($op->name eq 'padsv') {
+        my $target = (($cv->PADLIST->ARRAY)[0]->ARRAY)[$op->targ];
+        if(UNIVERSAL::isa($target,'B::SV') && $target->FLAGS & SVpad_TYPED) {
+            $typed{$cv->ROOT->seq}->{$op->targ}->{type} = $target->SvSTASH->NAME;
+            $typed{$cv->ROOT->seq}->{$op->targ}->{name} = $target->PV;
+        } elsif(UNIVERSAL::isa($target,'B::SV') &&
+                exists($typed{$cv->ROOT->seq}->{$target->PV})) {
+            $typed{$cv->ROOT->seq}->{$op->targ} = $typed{$cv->ROOT->seq}->{$target->PV};
+        }
+    }
 
 ------------
 
@@ -1061,12 +1195,6 @@ in lexicalref() :
       # print "testing: trying to extract RV then IV: ", lexicalref($self->first()->targ()), "\n";
       # print "testing: trying to extract RV then IV: ", lexicalref($self->first()->targ())->RV()->RV(), "\n";
       # print "testing: trying to extract RV then IV: ", lexicalref($self->first()->targ())->RV()->int_value(), "\n";
-
-I think the problem we're having with matching pads up to scalars is that we're
-getting the scratch pad entry itself, not the value to which it points. This
-is pretty clear since the variables name is stored in there.
-
-Okey, past that. Still trying to replicate \$foo.
 
 to get a name out of a pad:
 
@@ -1121,66 +1249,10 @@ java would be applied: the thing on the right must be an isa() of the thing on
 the left. the actual scalar reference and sub wouldn't be itself blessed,
 but instead the ISA checks would be done on whatever types were given to attribute.
 
-----------
+------
 
-# $baz = $foo->new(); 
-
-2n <;> nextstate(main 556 test.pl:58) v
-2o <0> pushmark s
-2p <0> padsv[$foo:552,558] sM
-2q <$> method_named(PVIV "new") s
-2r <1> entersub[t15] sKS/TARG
-2s <0> padsv[$baz:554,558] sRM*
-2t <2> sassign vKS/2
-
-------------
-
-# $bar = $foo->foo($foo, 1, $bar, $baz, 2, 3, lala());
-
-23 <;> nextstate(main 547 test.8.pl:39) v
-24 <0> pushmark s
-25 <0> padsv[$foo:544,548] sM                # $foo->
-26 <0> padsv[$foo:544,548] lM                # ($foo,
-27 <$> const(IV 1) sM                        # 1
-28 <0> padsv[$bar:545,548] lM                # $bar
-29 <0> padsv[$baz:546,548] lM                # $baz
-2a <$> const(IV 2) sM                        # 2
-2b <$> const(IV 3) sM                        # 3
-2c <0> pushmark s                            # lala()
-2d <$> gv(*lala) s/EARLYCV                   #  "
-2e <1> entersub[t12] lKMS/NO(),TARG,INARGS,1 # "
-2f <$> method_named(PVIV "foo") s            # foo(
-2g <1> entersub[t13] sKS/TARG                # "
-2h <0> padsv[$bar:545,548] sRM*              # $bar =
-2i <2> sassign vKS/2                         # "
-2j <;> nextstate(main 548 test.8.pl:43) v
-
-# from arg_types():
-# use solve_type() recursively instead...
-
-    if($op->name() eq 'padsv') {
-      $right = $scalars->{$op->targ()} if $op->name() eq 'padsv' and exists $scalars->{$op->targ()};
-      $left and ! $right and return "argument number " . ($index + 1) . " must be type $left according to prototype. ";
-    } elsif($op->name() eq 'const') {
-      return sprintf "argument number %d, constant '%s' found where type '%s' expected. ", $index+1, $op->sv()->sv(), $left;
-    } # elsif($op->name() eq 
-
-  # c           <0> pushmark s ->d
-  # d           <0> padsv[$a:3,5] sM ->e
-  # e           <$> const(IV 5) sM ->f
-  # f           <$> const(IV 4) sM ->g
-  # g           <$> const(IV 3) sM ->h
-  # h           <$> const(IV 2) sM ->i
-  # i           <$> const(IV 1) sM ->j
-  # j           <$> method_named(PVIV "bar") s ->k
-
-
---------
 Perl stores an amazing amount of data in the bytecode tree. This makes
 static analysis both a joy and a fertile field of study. 
-
-A few this are missing. C<my FooBar $c> doesn't record "FooBar" unless an
-attribute is included: C<my FooBar $c :typed>.
 
 Source filters can do some things that the B modules can't. L<Acme::Bleach>
 operates on something radically different than Perl. L<Sub::Lexical>
@@ -1189,5 +1261,212 @@ See L<Filter::Simple> for information on source filters.
 
 See perldoc B and L<B::Generate> for more information on Perl's bytecode
 interpreter, B.
+
+---------------------------
+
+processing return statements:
+
+r     <;> nextstate(main 564 test.9.pl:32) v ->s
+y     <@> return K ->z
+s        <0> pushmark s ->t
+t        <0> padsv[$bar:563,564] ->u          # $bar
+u        <$> const(IV 10) s ->v               # 10
+x        <1> entersub[t5] KS/TARG,1 ->y       # bar()
+-           <1> ex-list K ->x
+v              <0> pushmark s ->w
+-              <1> ex-rv2cv sK/1 ->-
+w                 <$> gv(*bar) s ->x
+z     <;> nextstate(main 564 test.9.pl:34) v ->10
+
+---------------------------
+
+processing closures:
+
+lightbright# perl -MO=Concise -e 'sub { print "hi\n"; }->();'
+8  <@> leave[&:-586,-588] vKP/REFC ->(end)
+1     <0> enter ->2
+2     <;> nextstate(main 2 -e:1) v ->3
+7     <1> entersub[t2] vKS/TARG,1 ->8
+-        <1> ex-list K ->7
+3           <0> pushmark s ->4
+-           <1> ex-rv2cv K/1 ->-
+6              <1> refgen sK/1 ->7
+-                 <1> ex-list lKRM ->6
+4                    <0> pushmark sRM ->5
+5                    <$> anoncode[CV ] lRM ->6
+
+anoncode's t_arg is a pointer to code - an op perhaps even?
+
+------
+
+from types.pm:
+
+    if(ref($op) eq 'B::PADOP' && $op->name eq 'gv') {
+#       $op->dump;
+        my $target = (($cv->PADLIST->ARRAY)[1]->ARRAY)[$op->padix];
+#       $target->dump;
+#       exit;
+    }
+
+
+-------
+
+# this was in the first version:
+
+use attributes;
+
+sub MODIFY_SCALAR_ATTRIBUTES {
+  # this, like declare()'s definition above, does nothing when executed, but
+  # generates signiture code in the bytecode tree. it is this signiture that
+  # we recognize and extract information from.
+  return () if $_[2] eq 'typed'; # success
+  return undef;                  # don't know that attribute, sorry
+}
+
+  # my FooBar $foo :typed;
+
+  # 2  <;> nextstate(main 514 test.pl:32) v
+  # 3  <0> pushmark v
+  # 4  <0> pushmark s
+  # 5  <$> const(PV "attributes") sM      --- we start scanning here
+  # 6  <$> const(PV "FooBar") sM
+  # 7  <0> padsv[$foo:514,516] sRM
+  # 8  <1> srefgen sKM/1
+  # 9  <$> const(PV "typed") sM
+  # a  <$> method_named(PVIV 1878035063) 
+  # b  <1> entersub[t2] vKS*/DREFSV       --- and stop here
+  # c  <0> padsv[$foo:514,516] vM/LVINTRO
+  # d  <@> list vK/128
+
+  if($self->name() eq 'const') {
+    # go on the lookout for type checked variable definitions
+    # we record the pad and name of variables defined using our little type specifying idiom
+    # this is needed so that we can relate pad information to name/package/type/etc
+    # lookup_targ() now tries to set up new variables that are otherwise undefined.
+    my $op = $self;
+    my $pad; my $type; 
+    # print "debug: entersub - looking for pad info for my() syntax - going in, line $lastline...\n";
+    foreach my $test (
+      sub { $op->name() eq 'const' and $op->sv()->sv() eq 'attributes'  },   # "attributes"
+      sub { $op->name() eq 'const' and $type = $op->sv()->sv()  },           # "FooBar" - type information
+      sub { $op->name() eq 'padsv' and $pad = $op->targ()  },  
+      sub { $op->name() eq 'srefgen' },
+      sub { $op->name() eq 'const' and $op->sv()->sv() eq 'typed'  },        # "typed" - attribute name
+      sub { $op->name() eq 'method_named' },
+      sub { return unless $op->name() eq 'entersub'; associate_scalar($pad, $type); },
+    ) {
+       # print "debug: considering: looking for pad info: ", $op->name(), "\n";
+       last unless $test->(); 
+       $op = $op->next() or last; # using next() here, not sibling(), on purpose 
+    }
+  }
+
+----------
+
+  # declare FooBar => my $test3;
+
+  # l  <;> nextstate(main 581 test.3.pl:25) v
+  # m  <0> pushmark s                            <--- start scanning here
+  # n  <$> const(PV "FooBar") sM/BARE
+  # o  <0> padsv[$test3:581,582] lM/LVINTRO
+  # p  <$> gv(*declare) s
+  # q  <1> entersub[t5] vKS/TARG,1
+  # r  <;> nextstate(main 582 test.3.pl:27) v
+
+  if($self->name() eq 'pushmark') {
+    # go on the lookout for type checked variable definitions
+    # we record the pad and name of variables defined using our little type specifying idiom
+    # this is needed so that we can relate pad information to name/package/type/etc
+    my $op = $self;
+    my $pad; my $type; 
+    # print "debug: entersub - looking for pad info for declare() syntax - going in, line $lastline...\n";
+    foreach my $test (
+      sub { $op->name() eq 'pushmark' },
+      sub { $op->name() eq 'const' and $type = $op->sv()->sv()  },           # "FooBar" - type information
+      sub { $op->name() eq 'padsv' and $pad = $op->targ()  },  
+      sub { $op->name() eq 'gv' and ($op->sv()->sv() eq 'declare' or $op->sv()->sv() =~ m/::declare$/) }, # "declare"
+      sub { return unless $op->name() eq 'entersub'; associate_scalar($pad, $type);  },
+    ) {
+      # print "debug: looking for pad info: considering: ", $op->name(), "\n";
+      last unless $test->(); 
+      $op = $op->next() or last; # doing next() on purpose, not sibling()
+    }
+  }
+
+-----------------------
+
+package FooBar; 
+use typesafety; 
+package main; 
+use typesafety; 
+(declare FooBar => my $test5) = 10;
+
+c  <@> leave[$test5:525,526] vKP/REFC ->(end)
+1     <0> enter ->2
+2     <;> nextstate(main 525 -e:1) v ->3
+b     <2> aassign[t3] vKS ->c
+-        <1> ex-list lK ->5
+3           <0> pushmark s ->4
+4           <$> const(IV 10) s ->5
+-        <1> ex-list lK ->b
+5           <0> pushmark s ->6
+a           <1> entersub[t2] lKPRMS*/NO(),TARG,1 ->b
+-              <1> ex-list lK ->a
+6                 <0> pushmark s ->7
+7                 <$> const(PV "FooBar") sM/BARE ->8
+8                 <0> padsv[$test5:525,526] lM/LVINTRO ->9
+-                 <1> ex-rv2cv sK/129 ->-
+9                    <$> gv(*declare) s ->a
+
+------
+
+  # more old, retired original code
+
+  sub associate_scalar {
+
+    my $pad = shift;   # pad slot number
+    my $type = shift;  # litteral name of the type
+
+    lookup_targ($pad) and
+      confess lexicalname($pad) . ' already defined: first declaration: ' . $scalars->{$pad}->diagnostics() . ' ' . 
+          ' second declaration: ' . nastily;
+
+    $scalars->{$pad} = get_type_ob($type, $lastpack, $lastfile, $lastline, $pad, lexicalname($pad), 'variable');
+    # print "debug: success - found pad of variable ", $scalars->{$pad}->name(), " - pad $pad, at file $lastfile line $lastline\n";
+  }
+
+-------
+
+# sub foo (int $la, string $bar) {
+# }
+
+    if($cv->FLAGS & SVf_POK && !$function_params{$cv->START->seq}) {
+        #we have, we have, we have arguments
+        my @type;
+        my @name;
+        my $i = 1;
+        foreach (split ",", $cv->PV)  {
+            my ($type, $sigil, $name) = split /\b/, $_;
+        #    print "$type - $sigil - $name \n";
+            push @type, $type;
+            if($sigil && $name)  {
+                push @name, $sigil.$name;
+                $typed{$cv->ROOT->seq}->{"$sigil$name"}->{type} = $type;
+                $typed{$cv->ROOT->seq}->{"$sigil$name"}->{name} = $sigil.$name;
+            } else {
+                push @name, "Argument $i";
+            }
+            $i++;
+        }
+
+        $function_params{$cv->START->seq}->{name} = \@name;
+        $function_params{$cv->START->seq}->{type} = \@type;
+
+
+        #print $cv->PV . "\n";
+        $cv->PV(";@");
+
+    }
+
 
 
