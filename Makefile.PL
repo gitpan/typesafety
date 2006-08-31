@@ -5,6 +5,7 @@ WriteMakefile(
     'NAME'		=> 'typesafety',
     'VERSION_FROM'	=> 'typesafety.pm', # finds $VERSION
     'PREREQ_PM'		=> {'B::Generate' => 1.0}, # e.g., Module::Name => 1.1
+    'PREREQ_FATAL'      => 1,
     'ABSTRACT'          => 'typesafety.pm - compile-time type usage static analysis',
     ($] >= 5.005 ?    ## Add these new keywords supported since 5.005
        (AUTHOR     => 'Scott Walters <scott@slowass.net>') : ()),

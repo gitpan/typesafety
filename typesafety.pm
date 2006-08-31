@@ -5,6 +5,13 @@ package typesafety;
 #
 
 #
+#  But I see little reason to make $! readonly by default. All that       
+#  does  is  prevent  clever  people from doing clever things that we haven't thought of yet. And it won't stop stupid people from doing 
+#  stupid things.
+#  - Larry Wall, Apocalypse 4
+#
+
+#
 # this program aims to be well documented!
 # if you don't understand something, and you've read http://perldesignpatterns.com/?PerlAssembly,
 # the source and the comments, the writeups on the end of this file, and the
@@ -17,8 +24,67 @@ package typesafety;
 # then you're bound to be confused - this stuff is pretty intense.
 #
 
-# major outstanding issues - see also Bugs in the POD:
+# short-list of outstanding problems:
 
+# o. $self->customer_template->($mail_data) (method returns closure) causes haavok
+# o. sub foo { my $self = shift; $self->x } isn't being correctly scanned -- don't remember if it ever
+#    assumed that $self was a __PACKAGE__ so I don't know if this is broken or unimplemented or I'm doing it wrong
+# o. $ob->{foo} gave an error calling methodob->subscript; need to merge this much of the hashob and methodob 
+#    functionality -- logic on and around 901 plus the typeobs
+# ....
+# o. support for hash style argument lists
+# o. support for closures -- arguments and return types
+# o. as far as our ->isa() is concerned, a Foo::Bar should isa Bar and vice versa -- this
+#    is a crutch for the my Foo::Bar $baz problem.
+# o. recognize method calls to methods created by Attribute::Property as typed variables
+#    with inferred type. That is, $self->foo = $foo should be logically the same thing as the 
+#    hash deref it stands in for, $self->{foo} = $foo. Perhaps this should be a general
+#    rule of lvalue methods and subs - whatever types get assigned in come back out.
+
+# bugs fixed this version:
+# o. calling Foo::bar, such as with CGI::param(), is unchecked if the package specified isn't in the known universe
+# o. skips checking subs/methods imported from other packages
+
+# major outstanding problems - see also Bugs in the POD:
+
+# o. hashes with individual types in each slot - okey, this is kinda bitchy. first instinct
+#    is just to wrap the typeob::inferredob inferred type. if there are no overlapping
+#    keys then it will never fail and that's bad. second instinct is to autovivicate
+#    on the assigned-to side so that inconsistent assigns in the future can be cought.
+#    have to autovivicate on both sides maybe. if we took a lesson from arrays, every
+#    time the hash was assigned to something else, we'd want to go back and check
+#    all of the constraints again with the new data - that's where it starts to get
+#    bitchy. guess we could keep an array for emits and accepts and test them against
+#    each other but compare hashes instead of primitive types.
+#    but that doesn't fix the original problem - when are two hashes different? 
+#    two very different hashes can coexist. i guess this is okey as strange as it sounds.
+#    as soon as something looks expects a type in a slot and it isn't there we've cought
+#    the inconsistency. that means hashes can be composed like objects almost -
+#    it can have fields that come from all over the place. several very different
+#    hashes can be rolled up in one.
+# o. arrays and hashes should be able to contain other arrays and hashes - what was treated
+#    as a scalar should be promoted to an arrayob or hashob when it is used as one.
+#    this is a general question of references - a padsv is used to get the ref, then rv2av
+#    or rv2hv turns that into the desired type. so we have a padsv that is really a 
+#    hash or array. guess we just look for the rv2av and rv2hv ops before we look for
+#    the padsv op and promote or create of the correct type as necessary.
+# o. my Foo::Bar $baz doesn't work - a workaround is mentioned elsewhere. just repeating.
+# o. "my Foo $bar" is used by fields.pm as well
+# o. <kismet> your module works great if I can expect Foobar $bar to hold the same properties as Foobar $foo :)
+#    but you'd need support to allow overrides on Foobar before $foo is setup.
+#    something like my Foobar qw/blah baz foof/;  my Foobar $Foo;
+#    or:  my FooBar $foo :mutable :persistent :fugly;
+# o. aslice. test map and grep - they just might work right now.
+# o. Malformed prototype for main::foo: BarBaz;Qux at -e line 1. - we've passed the point of no return.
+#    we have to run so we can fix prototypes. we should delay loading code we don't need beyond the basics
+#    needed to do ths. otherwise, we could do a compile() routine that runs at perl -MO=Typecheck or something.
+# o. $_[0]->[0], $_[0]->{foo} - our data fields aren't typed and they aren't invidually typed. 
+#    this would work very nicely with Object::Lexical, but even using O::L, you'd want to 
+#    use hash or array fields for data accessable to super/sub classes. when data is assigned,
+#    type is ignored and no error is generated, but data cannot be pulled out of our 
+#    $self and assigned to a typed scalar or returned from a prototyped method.
+#    However, if you never unshift, push, pop, or shift, but only use array indexes, eg $ar[3], and only with constants for indexes, then
+#    each element of the array should be considered to have a seperate type so that you can make classes based on arrays
 # o. rather than one huge sequence of if statements, solve_type() should dispatch based on
 #    op name and/or other information. this is getting massive. a pattern is starting to
 #    emerge - most ops just do solve_type(), solve_list_type(), enforce_type(), or enforce_list_type()
@@ -26,9 +92,18 @@ package typesafety;
 #    with different error messages provided where enforce* methods are used.
 # o. $expected could be better enforced
 # o. typesafety::methodob should handle unshift, pop, push as well as shift and aelem.
+# o. tools to generate type API cross references - who accepts what type, what returns what type,
+#    and so forth. adding idioms to typesafety.pm to understand 'use base' and 'push @ISA'
+#    would help with this.
+# o. more tests - test for more bless idioms and do better coverage - checking
+#    common types from lists and returns, for example.
 
 # maybe outstanding issues - see also Future Direction in the POD:
 
+# o. provide a typesafety::diagnostics() function that produces diagnostic output for a given
+#    scalar. have to make notes from the bytecode tree to pull this off unless we learn how
+#    to better navigate pads.
+# o. after running, reclaim the memory we've used by undefing everything.
 # o. check_args() does: goto OKEY if $rightob->type()->isa($left); - $left is just a string,
 #    like FooBar. perhaps it would be helpful to keep a special hash of typeobs by package.
 #    the typeob would be a default generic typeob representing the return type of the constructor,
@@ -54,10 +129,6 @@ package typesafety;
 # o. what exactly is padix?
 # o. mangle function names using source filters and do method overloading based on those mangled names?
 # o. check_types() should be used more often. i think it could remove a lot of code.
-# o. litteral type names in strings - eg, arguments to bless. we might have to track data
-#    with completely different heuristics and intentions to see if the first arg to a 
-#    constructor gets converted from a possible object reference to a string and then
-#    winds up being used as the second arg to bless. argh.
 # o. something like solve_list_type(), but rather than trying to find the value of everything
 #    (as is appropriate for list assignments, argument construction to things like grep, etc),
 #    just find the common type from the fall through value and any return values.
@@ -67,9 +138,18 @@ package typesafety;
 #    perhaps a flag in typeob that indicates a calculated type is a returned/last in block.
 #    a real understanding of perl's internal stacks and the ops that minipulate them is
 #    what is really needed.
+# o. pluggable usaging checking modules, sort of like Joel on Software's Hungarian
+#    notion example, where deltas and absolute pixel couldn't be directly assigned to
+#    each other (that would be a bug) but may be mixed in formulas in certain ways
+#    (in this case, deltas can be added to absolute coordinates and maybe subtracted as 
+#    well).
 
 # major resolved issues:
 
+# v/ litteral type names in strings - eg, arguments to bless. we might have to track data
+#    with completely different heuristics and intentions to see if the first arg to a 
+#    constructor gets converted from a possible object reference to a string and then
+#    winds up being used as the second arg to bless. argh.
 # v/ types.pm allows method prototypes like sub foo (int $bar, string $baz) - amazing! how? steal!
 #    insert code into the op tree to create scalars and read arguments specified in the prototype ().
 # v/ more method argument handling and bless idioms.
@@ -193,11 +273,11 @@ package typesafety;
 #    from the end?! just before the main loop? hrm. don't know how this is going to work. manual call
 #    for now.
 
-use 5.8.0;
+use 5.8.8;
 use strict;
 no strict 'refs';
 use warnings;
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 use B;
 use B::Generate;
@@ -213,7 +293,7 @@ use B qw< SVf_IOK SVf_NOK SVf_POK SVf_IVisUV >;
 sub SVs_PADMY () { 0x00000400 }     # use B qw< SVs_PADMY >;
 
 #
-# er, variable
+# variables
 #
 
 my %knownuniverse; # all known namespaces - our inspection list
@@ -290,7 +370,7 @@ sub import {
     my $package = shift;
     my $method = shift;
     return exists $methods->{$package} if ! defined $method;
-    return $methods->{$package}->{$method} if exists $methods->{$package} and exists $methods->{$package}->{$method};
+    return $methods->{$package}->{$method} if defined $package and defined $method and exists $methods->{$package} and exists $methods->{$package}->{$method};
     return undef;
   }
 
@@ -298,7 +378,7 @@ sub import {
     # like lookup_method, but concerned with the fundamental type. for now, we're using the return value of
     # new() in that package, and inferring it if we must.
     my $typename = shift;
-    debug("lookup_type called for $typename");
+    debug("lookup_type called for @{[ $typename || '(undef)' ]}");
     return lookup_method($typename, 'new') || typesafety::methodob->new(type=>$typename, desc=>'generic package type', literal=>$typename);
   }
   
@@ -341,12 +421,38 @@ sub import {
     # specified, for now. eg: my FooBar $foo. later, though, we may attempt to track all of the different things expected of a scalar
     # in the default package and everything assigned to it. arrays, too.
 
+    # from B::Concise.pm - $padname is our $name:
+    #        if ($padname->FLAGS & SVf_FAKE) {
+    #            my $fake = '';
+    #            $fake .= 'a' if $padname->IVX & 1; # PAD_FAKELEX_ANON
+    #            $fake .= 'm' if $padname->IVX & 2; # PAD_FAKELEX_MULTI
+    #            $fake .= ':' . $padname->NVX if $curcv->CvFLAGS & CVf_ANON;
+    #            $h{targarglife} = "$h{targarg}:FAKE:$fake";
+    #        }
+    #        elsif(defined $padname) { # sdw 2003
+    #            my $intro = $padname->NVX - $cop_seq_base;
+    #            my $finish = int($padname->IVX) - $cop_seq_base;
+    #            $finish = "end" if $finish == 999999999 - $cop_seq_base;
+    #            $h{targarglife} = "$h{targarg}:$intro,$finish";
+    #        }
+    # B::Concise prints out [t9] for 'temporary pad 9'. Something is temp when its class is 'SPECIAL'.
+    # But where and why does its class set to SPECIAL? What is tested? Above is the non-special case.
+    # Ahah!
+    # From the perl source in the pad.c file:
+    #   Iterating over the names AV iterates over all possible pad
+    #   items. Pad slots that are SVs_PADTMP (targets/GVs/con-
+    #   stants) end up having &PL_sv_undef "names" (see
+    #   pad_alloc()).
+    # And lots of other great notes.
+
     my $type;
     $type = $name->SvSTASH->NAME if $name->can('SvSTASH');
 
     if( ! $type or $type eq 'main' ) {
       return $scalars->{$curcv}->{$targ} = typesafety::scalarob->new(
-        type=>'none', desc=>'non-type-checked scalar', pad=>$targ, name=>$name->sv(),
+        type=>'none', desc=>'non-type-checked scalar', pad=>$targ, 
+        # name=>$name->sv(),
+        name=>$name->PVX(),
         package=>$lastpack, filename=>$lastfile, line=>$lastline,
       );
     }
@@ -354,8 +460,12 @@ sub import {
     # since we've never seen this lexical in this context before, we assume that it is new, and this is its first
     # usage. record the information for the current point in the perl program we're crawling.
 
+    # highly experimental -- 'XX' gets transmorgified to '::' since '::' can't appear in my declarations
+    # $type =~ s/XX/::/g; # no, this doesn't work -- Perl says 'no such class' when the package doesn't exist
+    # can't just use the last part (eg, Bar in Foo::Bar) and guess the rest either for the same reason
+
     return $scalars->{$curcv}->{$targ} = typesafety::scalarob->new(
-        type=>$type, desc=>'scalar variable named', pad=>$targ, name=>$name->sv(),
+        type=>$type, desc=>'scalar variable named', pad=>$targ, name=>$name->PVX(), # name=>$name->sv(), # XXX highly experimental 000
         package=>$lastpack, filename=>$lastfile, line=>$lastline, 
     );
 
@@ -364,12 +474,23 @@ sub import {
   sub lookup_array_targ {
     # this is used on arrays - we can't hope to find type information for, but we want to
     # keep a record of it anyway. still must be lexical.
+    # the lookup_targ() just spares us the bother of looking things up that are already defined.
     my $targ = shift;
-    return lookup_targ($targ) if lookup_targ($targ);
+    return $scalars->{$curcv}->{$targ} if exists $scalars->{$curcv} and exists $scalars->{$curcv}->{$targ};
     my $ret = $scalars->{$curcv}->{$targ} = typesafety::arrayob->new(
         pad=>$targ, name=>lexicalname($targ), desc=>'array variable named',
     );
     $debug and print "debug: ", __LINE__, ": lookup_array_targ: created this: ", $ret->diagnostics(), "\n";
+    return $ret;
+  }
+
+  sub lookup_hash_targ {
+    my $targ = shift;
+    return $scalars->{$curcv}->{$targ} if exists $scalars->{$curcv} and exists $scalars->{$curcv}->{$targ};
+    my $ret = $scalars->{$curcv}->{$targ} = typesafety::hashob->new(
+        pad=>$targ, name=>lexicalname($targ), desc=>'hash variable named',
+    );
+    $debug and print "debug: ", __LINE__, ": lookup_hash_targ: created this: ", $ret->diagnostics(), "\n";
     return $ret;
   }
   
@@ -386,11 +507,12 @@ sub import {
 
   my $cannedtypes = {
     none      => typesafety::typeob->new(type => 'none',     desc => "construct doesn't return any value at all"), 
-    unknown   => typesafety::typeob->new(type => 'unknown',  desc => "construct returns a value - probably - but what, we aren't sure"),
+    unknown   => typesafety::typeob->new(type => 'unknown',  desc => "construct returns a value -- probably -- but what, we aren't sure"),
     constant  => typesafety::typeob->new(type => 'constant', desc => 'constant value'), 
     int       => typesafety::typeob->new(type => 'int',      desc => 'integer value'),  
     float     => typesafety::typeob->new(type => 'float',    desc => 'floating point value'), 
     string    => typesafety::typeob->new(type => 'string',   desc => 'string value'), 
+    # inferred  => typesafety::inferredob->new(                desc => 'type inferred from usage'),
   };
 
   *canned_type = sub {
@@ -411,11 +533,13 @@ sub check {
   # from them. when a pattern is found, we update internal information, or
   # else test internal information to see if something is "safe".
 
+  $knownuniverse{$_}++ for @_; # users can pass in names of namespaces to add to the check list
+
   foreach my $package (keys %knownuniverse) {
     foreach my $method (grep { defined &{$package.'::'.$_} } keys %{$package.'::'}) {
 
-      # we're looking for things in the code like this: sub foo (int $la, string $bar) { }
-      # revised: sub foo (FooBar; BazQux, FooBar, undef) {  }
+      # we're looking for things in the code like this: 
+      # sub foo (FooBar; BazQux, FooBar, undef) {  }
       # this is based on Arthur Bergman's code in types.pm. i bastardized it - typesafety.pm is no where near as elegant.
 
       my $cv = B::svref_2object(*{$package.'::'.$method}{CODE});
@@ -428,16 +552,26 @@ sub check {
           my @prot;
           my $returns;
 
+          $sig =~ m/(?:\w+;)|(?:,)/ or do {
+              *{$package.'::proto'}{CODE}->($method, 'returns', undef, 'takes', undef);
+              return;
+          };
+
           ($returns, $sig) = $sig =~ m/^\s*(\w+);(.*)/;
           $returns = undef if $returns eq 'undef';
 
           foreach my $type (split /\s*,\s*/, $sig)  {
+              no warnings 'uninitialized';
               debug("method signature: $package $method returns $returns - next arg: $type");
               $type = undef if $type eq 'undef';  
               push @prot, $type;
           }
 
           # proto syntax: proto 'foo', returns => 'FooBar', takes => 'FooBar', undef, 'FooBar', 'BazQux', undef, undef, undef;
+
+          # debug("prototype: method: ``@{[ $method||'undef' ]}'' returns: ``@{[ $returns||'' ]}'' takes: ``@{[ @prot ? join ', ', map $_||'(undef)', @prot : '(nothing)' ]}''"); # argh!! and still uninitialized errors!?
+          no warnings 'uninitialized';
+          debug("prototype: method: ``$method'' returns: ``$returns'' takes: ``@prot''");
 
           *{$package.'::proto'}{CODE}->($method, 'returns', $returns, 'takes', @prot);
 
@@ -453,7 +587,7 @@ sub check {
   $returnvalue = undef;
 
   $curcv = B::main_cv();
-  solve_list_type(B::main_root()->first(), undef);
+  B::main_root->name ne 'null' and solve_list_type(B::main_root()->first(), undef); # denull doesn't help...? when does this happen?
 
   # each package that has used us, check them as well
 
@@ -466,6 +600,12 @@ sub check {
       next if $method eq 'proto';
       next if $method eq 'declare';
 
+      # STDERR->print("debug: ************ stashname: ", B::svref_2object(*{$package.'::'.$method}{CODE})->STASH()->NAME(), "\n");
+      next if B::svref_2object(*{$package.'::'.$method}{CODE})->STASH()->NAME() ne $package; # skip code imported from elsewhere
+
+
+      debug("checking $package\::$method");
+
       # return statements out of methods are expected to return a certain type, as are fall-through values.
 
       # debug("knownuiverse: method: $method");
@@ -474,7 +614,8 @@ sub check {
       $curcv = B::svref_2object($cv);
       B::svref_2object($cv)->ROOT() or die;
 
-      $debug and concise_cv(0, $cv); # dump the opcode tree of this code value
+      # $debug and concise_cv(0, $cv); # dump the opcode tree of this code value
+      # B::Concise::walk_topdown($curcv->ROOT(), sub { $_[0]->concise($_[1]) }, 0);
 
       my $expected = lookup_method($package, $method);
 
@@ -551,10 +692,10 @@ sub solve_type {
      $self->flags & OPf_KIDS and
      $self->first() 
   ) {
-    $debug and print "debug: ", __LINE__, ": null type: ppname: ", $self->can('targ') ? ppname($self->targ()) : 'unknown', "\n";
-    $debug and print "debug: ", __LINE__, ": null op has kids, first is: ", $self->first()->name(), "\n";
-    # $debug and print "debug: ", __LINE__, ": null op has kids, second is: ", $self->first()->sibling()->name(), "\n";
-    return solve_type($self->first(), $expected);
+    debug("null type: ppname: ", $self->can('targ') ? ppname($self->targ()) : 'unknown');
+    debug("null op has kids, first is: ", $self->first()->name());
+    # return solve_type($self->first(), $expected); # XXX - if first child is an ex-list, this is completely worthless
+    return solve_list_type($self->first(), $expected);
   }
 
   # c           <|> cond_expr(other->d) lK/1 ->h
@@ -587,8 +728,11 @@ sub solve_type {
   if($self->name() eq 'leaveloop') {
     # we don't expect that a for() loop returns anything, but we should check inside of it and the conditional.
     # which is the first thing at the beginning of the body. how bizarre.
-    check_list_type($self->first(), undef); 
-    check_list_type($self->first()->sibling(), undef); 
+    # sdw -- 2005 -- unknown subroutine check_list_type()
+    # check_list_type($self->first(), undef); 
+    # check_list_type($self->first()->sibling(), undef); 
+    solve_list_type($self->first(), undef); 
+    solve_list_type($self->first()->sibling(), undef); 
   }
 
   if($self->name() eq 'and') {
@@ -611,6 +755,7 @@ sub solve_type {
     # information with information recorded from attributes at compile time.
 
     $lastpack = $self->stash()->NAME();
+    # $lastpack = 'XXX';
     $lastfile = $self->file();
     $lastline = $self->line();
 
@@ -629,9 +774,34 @@ sub solve_type {
   if($self->name() eq 'const') {
     # very simple case
     debug('const');
-    my $type = canned_type('constant')->clone(sprintf q{'%s', }, $self->sv()->sv());
-    $type->literal = $self->sv()->sv();
+    debug("going to look at sv");
+    # my $sv = $self->sv;
+    my $value; 
+    $value = eval { $self->sv->sv }; $@ and $value = '(unknown constant value)';
+
+    # this mess got written trying to solve the "I am sorry but we couldn't find this root!" B::Generate error
+    # but it looks like the $foo->{bleah}->foo construct just plays haavok with B::Genreate's presentation of the const op
+    #if($sv->isa("B::IV")) { $value = $sv->int_value; debug("B::IV"); }
+    #elsif($sv->isa("B::NV")) { $value = $sv->NVX; debug("B::NV"); }
+    #elsif($sv->isa("B::RV")) { $value = $sv->RV; debug("B::RV"); }  # XXX this is meaningless
+    #elsif($sv->isa("B::PV")) { $value = $sv->PV; debug("B::PV"); }
+    #elsif($sv->isa("B::GV")) { $value = $sv->SV->sv; debug("B::GV"); }  # XXX this one needs to recurse rather do ->sv()
+    #elsif($sv->isa("B::PV")) { $value = $sv->PV; debug("B::PV"); }
+    #elsif($sv->isa("B::PVIV")) { $value = $sv->PV; debug("B::PVIV"); } # B::PVIV is a subclass of B::PV
+    #else { $value = $self->sv; debug("B:: whatever... default..."); } # not sure when this case runs
+    ## B::IO, B::AV, B::HV, others not delt with at all -- don't think it's possible to use them with const
+
+    # $self->sv->sv is fine with things like <<const(PV "foo") s>> but hates things like <<const(PVIV "credit_card_number") s/BARE>>
+    # trying PV instead of PVX or SV
+
+    my $type = canned_type('constant')->clone(sprintf q{'%s', }, $value);
+    $type->literal = $value;
     return $type;
+
+    # this that don't work in all cases:
+    # my $type = canned_type('constant')->clone(sprintf q{'%s', }, $self->sv()->sv()); 
+    # my $type = canned_type('constant')->clone(sprintf q{'%s', }, $self->sv()->PVX()); # XXX highly experimental 000 # oops, didn't fly: Can't locate object method "PVX" via package "B::IV"
+    # $type->literal = $self->sv()->sv(); # $type->literal = $self->sv()->PVX(); -- same as above
   }
 
   # lexicals
@@ -639,19 +809,23 @@ sub solve_type {
   if($self->name() eq 'padsv') {
     # simple case
     # $debug and print "debug: ", __LINE__, ": padsv\n";
-    # this happens when we see non-typesafe scalars, which we tolerate ;)
     return lookup_targ($self->targ()); 
-      # || typesafety::scalarob->new(type=>'none', desc=>'non-type-checked scalar', pad=>$self->targ(), name=>lexicalname($self->targ()));
   }
 
   if($self->name() eq 'padav') {
     # array on the pad
     # it will never happen that we find type info for an array - perl doesn't allow this. we must infer types.
-    for(lookup_array_targ($self->targ())) {
-      debug("padav: official type: ", $_ ? $_->type() : 'no type info');
-      debug("padav: type of typeob object found: ", $_ ? ref($_) : 'none found');
-    }
+    # for(lookup_array_targ($self->targ())) {
+    #   debug("padav: official type: ", $_ ? $_->type() : 'no type info');
+    #   debug("padav: type of typeob object found: ", $_ ? ref($_) : 'none found');
+    # }
     return lookup_array_targ($self->targ());
+  }
+
+  if($self->name() eq 'padhv') {
+    # hash on the pad
+    # we don't find type information already associated with a hash when the hash is first found either.
+    return lookup_hash_targ($self->targ());
   }
 
   # stacked - XXX - todo
@@ -757,6 +931,26 @@ sub solve_type {
 
   }
 
+  # h        <2> helem sK/2 ->i
+  # f           <1> rv2hv[t2] sKR/1 ->g
+  # e              <0> padsv[$hash:1,2] sM/64 ->f
+  # g           <$> const(PVIV "1") s ->h
+
+  if($self->name() eq 'helem') {
+    my $type = solve_type($self->first()); # gets us a typeob, probably a hashob
+    ($type->can('stuff') and $type->stuff() eq 'hashob') or return canned_type('unknown'); # XXX highly experimental -- $ob->{foo} was screwing up
+    my $subscript = solve_lit($self->last()); # gets us constant index hopefully
+    debug('helem: diagnostics: ', $type->diagnostics());
+    debug('helem: constant subscript: ', $subscript) if $subscript;
+    if($subscript) {
+      $type->subscript($subscript) ||= 
+        typesafety::inferredob->new(type=>undef, package=>$lastpack, filename=>$lastfile, line=>$lastline, desc=>"$subscript hash key", name=>$subscript);
+      return $type->subscript($subscript);
+    } else {
+      return enforce_type($self->first(), $expected, 'wrong type in hash'); 
+    }
+  }
+ 
   #
   # pattern match ops
   #
@@ -789,11 +983,14 @@ sub solve_type {
   # 4                    <0> pushmark sRM ->5
   # 5                    <$> anoncode[CV ] lRM ->6
 
-  # anoncode's t_arg is a pointer to code - a B op object perhaps even?
+  # anoncode's t_arg is an index into the padlist for the current cv. at that index is a CV.
 
   if($self->name() eq 'anoncode') {
     # XXX untested
-    solve_type($self->targ(), $expected);
+    # XXX Perl6::Contexts does this right -- we do it wrong
+    my @padlist = $curcv->PADLIST->ARRAY->ARRAY; # voodoo based on logic in B::Utils
+    local $curcv = $padlist[$self->targ()];
+    solve_type($curcv->ROOT, $expected);
   }
 
   #
@@ -867,7 +1064,8 @@ sub solve_type {
 
      foreach my $test (
        sub { $op->name() eq 'pushmark' },
-       sub { return unless $op->name() eq 'const'; $type = $op->sv()->sv(); return 1; },
+       # sub { return unless $op->name() eq 'const'; $type = $op->sv()->sv(); return 1; }, # XXX highly experimental 000
+       sub { return unless $op->name() eq 'const'; $type = $op->sv()->PVX(); return 1; },
        sub {
          while($op->name() ne 'method_named' and $op->name() ne 'null') {
            # seek past method call arguments but remember the opcode of the first argument.
@@ -875,7 +1073,7 @@ sub solve_type {
            $op = $op->sibling();
          }
          return unless $op and $op->name() ne 'null'; 
-         return unless $op->sv()->sv() eq 'new'; 
+         return unless $op->sv()->PVX() eq 'new'; 
          $success = 1; 
          $debug and print "debug: success\n";
        },
@@ -902,6 +1100,16 @@ sub solve_type {
 
   # case, when the method is known and perl references the gv directly
 
+  # XXX stumbles on this case, where a closure is invoked:
+  # i     <2> sassign vKS/2 ->j
+  # g        <1> entersub[t6] sKS/TARG,1 ->h
+  # -           <1> ex-list sK ->g
+  # d              <0> pushmark s ->e
+  # e              <0> padsv[$mail_data:4,6] lM ->f
+  # -              <1> ex-rv2cv sK/1 ->-
+  # f                 <0> padsv[$mail_template:3,6] s ->g
+  # h        <0> padsv[$msg:5,6] sRM*/LVINTRO ->i
+
   if($self->name() eq 'entersub') {
 
      my $op = denull($self->first());
@@ -921,6 +1129,7 @@ sub solve_type {
              # XXX is ->gv()->sv() the way to get at the value in <5>gv(*FooBar::foo)? seems to work
              # XXX can we safely assume $lastpack if we can't find :: in the name?
              # debug - confess
+             $op->first()->name eq 'padsv' and return undef; # XXX this is the closure-invoking case we're not currently dealing with
              ($type, $method) = $op->first()->gv()->sv() =~ m{^\*(.*)::([^:]+)$} or confess;  
              $debug and print "debug: ", __LINE__, ": we think we have a function call - package $type function $method\n";
              return if $method eq 'proto'; # XXX
@@ -938,7 +1147,7 @@ sub solve_type {
        $op = $op->sibling() or last;
      }
 
-     return check_args($argop, $type, $method) if $success;
+     return check_args($argop, $type, $method) if $success and exists $knownuniverse{$type};
 
   }
 
@@ -976,11 +1185,13 @@ sub solve_type {
            $op = $op->sibling();
          }
          return unless $op and $op->name() eq 'method_named'; 
-         $method = $op->sv()->sv();                               # bar, in "$b = $a->bar()"
+         # whoops, busted. new in 5.9.0 apparently method names contain additional binary info after \0000.
+         # $method = $op->sv()->sv();                               # bar, in "$b = $a->bar()"
+         $method = $op->sv()->PVX();                               # bar, in "$b = $a->bar()"
          $success = 1;
        },
      ) {
-       # print "debug: ", __LINE__, ": considering: ", $op->name(), "\n";
+       print "debug: ", __LINE__, ": considering: ", $op->name(), "\n" if $debug;
        last unless $test->(); 
        $op = $op->sibling() or last;
      }
@@ -991,9 +1202,16 @@ sub solve_type {
           confess 'missing type information for ' . lexicalname($targ) . 
                   " in expression that should return " . $expected->diagnostics() . nastily if $expected;
        } else {
+         debug(lookup_targ($targ)->diagnostics());
          my $type = lookup_targ($targ)->type() or die nastily;          # $a, from "$b = $a->bar()"
-         lookup_method($type) or die 'unknown package: ' . $type . ' ' . nastily;
-         return check_args($argop, $type, $method);
+         if($type ne 'none') {
+             lookup_method($type, $method) or die "unknown method '$method' in class '$type' " . nastily;
+             # lookup_method($type) or die 'unknown package: ' . $type . ' ' . nastily;
+             return check_args($argop, $type, $method);
+         # I think this will just kinda happen by default if nothing else in solve_type() recognizes the construct
+         # } else {
+         #     canned_type('unknown');
+         }
        }
 
      }
@@ -1105,26 +1323,10 @@ sub solve_type {
   # 
 
   if($self->flags() & OPf_KIDS) {
-    # this should work for unops, binops, *and* listops
 
     $debug and print "debug: ", __LINE__, ": generic handling for UNOP/BINOP/LISTOPs: handling op: ", $self->name(), "\n";
 
-    # my $lasttype;
-    # this was how it was done:
-    # for(my $kid = $self->first(); $$kid; $kid = $kid->sibling()) {
-    #   # solve_type($kid, $expected); # too much to ask without understanding the ops themselves
-    #   # however, we could probably return the type of the last, if any
-    #   $lasttype = solve_type($kid, undef);
-    # }
-    # $debug && $expected and print "debug: ", __LINE__, ": recursing through unknown op, we pass through type ", 
-    #                               $lasttype->diagnostics(), " - we were expecting " . $expected->diagnostics() . "\n";
-    # $lasttype->isa($expected, 'expression was expected to evaluate to a certain type') if $expected;
-    # return $lasttype if $lasttype->type() ne 'none';
-
-    # this is how it is being done now - experimental:
-    # solve_list_type() looks at returns, and if anywhere should try to figure out where the fall-through value is, it is there.
-    # solve_list_type($self->first(), $expected);
-    # return solve_list_type($self->first(), undef);
+    # this should work for unops, binops, *and* listops
 
     return enforce_list_type($self->first(), $expected);
 
@@ -1279,7 +1481,7 @@ sub solve_list_type {
 
         $type = solve_type($op, $expected);
         confess "offending op was " . $op->name() . ' returned to us: ' . $type unless ref($type) and UNIVERSAL::isa($type, 'typesafety::typeob');
-        push @types, $type if $type->type() ne 'none';
+        push @types, $type if $type->type() and $type->type() ne 'none';
         $op = $op->sibling();
 
     }
@@ -1306,6 +1508,7 @@ sub common_type_from_list {
     foreach my $outter (@types) {
 
       foreach my $inner (@types) {
+        no warnings 'uninitialized';
         next if $inner->type() eq 'none';
         next OUTTER if $outter->type() eq 'none';
         next OUTTER unless $outter->isa($inner);
@@ -1351,7 +1554,8 @@ sub solve_lit {
   my $self = denull(shift());
 
   if($self->name() eq 'const') {
-    return $self->sv()->sv();
+    # return $self->sv()->sv(); # XXX highly experimental 0000
+    return $self->sv()->PVX();
   }
 
   if($self->name() eq 'ref') {{
@@ -1468,7 +1672,6 @@ sub denull {
      return denull($op);
    }
 
-
    return $op;
 
 }
@@ -1505,7 +1708,10 @@ sub emit     { }                             # noop in this bsae class
 sub literal  :lvalue { $_[0]->[10] }         # literal value stored in scalar, if known. new's prototype is reused as prototype first arg to new.
 sub created  :lvalue { $_[0]->[11] }         # internal debugging - which program line called the constructor
 
-sub argnum           { typesafety::confess } # typesafety::methodob - should never be called in this base class
+
+sub argnum     { typesafety::confess }       # 12 - next arg to be read, methodobs
+sub subobjects { typesafety::confess }       # 12 - hashes contain other invidually typed objects
+
 sub reset_prototype  { typesafety::confess } # typesafety::methodob 
 sub shift_prototype  { typesafety::confess } # typesafety::methodob 
 sub aelem_prototype  { typesafety::confess } # typesafety::methodob 
@@ -1537,8 +1743,10 @@ sub diagnostics {
   my @diag;
   push @diag, $self->desc if $self->desc;
   push @diag, $self->name if $self->name; # typesafety::confess unless $self->name;
-  push @diag, 'type ' . $self->type; typesafety::confess unless $self->type;
+  push @diag, 'type ' . $self->type if $self->type; # typesafety::confess unless $self->type;
   push @diag, 'containing the literal value "' . $self->literal . '"' if defined $self->literal;
+Carp::confess "strange crap in 'takes'" if $self->takes and ref($self->takes) ne 'ARRAY';
+  push @diag, 'taking as arguments the types "' . join(', ', map $_||'(undef)', @{ $self->takes }) . '"' if $self->takes and ref($self->takes) eq 'ARRAY';
   push @diag, 'created inside typesafety by request from line ' . $self->created if $debug;
   push @diag, sprintf 'defined in package %s, file %s, line %s', $self->package, $self->filename, $self->line if $self->package or $self->filename;
   return join ', ', @diag;
@@ -1550,6 +1758,8 @@ sub isa {
   my $arewe = shift or typesafety::confess(); 
   ref $arewe or typesafety::confess(); 
   my $fatal = shift; 
+  return 1 if ! $self->type();  # despite having a type object, they're untyped... this happens with methods prototyped to (undef; ...)
+  return 1 if ! $arewe->type();  # despite having a type object, we're untyped... this happens with methods prototyped to (undef; ...)
   return 1 if $self->type() eq $arewe->type() or $self->type()->isa($arewe->type()); 
   return undef unless $fatal;
   die join ' ', $fatal, ($fatal?': ':''),  "type mismatch: expected: ", $arewe->diagnostics(), 
@@ -1580,8 +1790,8 @@ sub unshift_prototype {
   my $argnum = $self->argnum++;
   return $self if $argnum == 0;   # OO perl adds $self as first argument - $_[0] is our own type
   # return lookup_type($self->type()) if $argnum == 0;   # OO perl adds $self as first argument
-  return lookup_type($takes->[$argnum - 1]) if exists $takes->[$argnum - 1];
-  return canned_types('unknown')->clone('shifted off an argument of unknown type in argument position ' . $argnum);
+  return typesafety::lookup_type($takes->[$argnum - 1]) if exists $takes->[$argnum - 1];
+  return typesafety::canned_type('unknown')->clone('shifted off an argument of unknown type in argument position ' . $argnum);
 }
 
 sub aelem_prototype {
@@ -1589,34 +1799,38 @@ sub aelem_prototype {
   my $argnum = shift() + $self->argnum;
   my $takes = $self->takes; 
   return $self if $argnum == 0;   # OO perl adds $self as first argument
-  return lookup_type($takes->[$argnum - 1]) if exists $takes->[$argnum - 1];
-  return canned_types('unknown')->clone('shifted off an argument of unknown type in argument position ' . $argnum);
+  return typesafety::lookup_type($takes->[$argnum - 1]) if exists $takes->[$argnum - 1];
+  return typesafety::canned_type('unknown')->clone('shifted off an argument of unknown type in argument position ' . $argnum);
 }
 
 sub reset_prototype { $_[0]->argnum = 0; }
 
+sub helem_prototype {
+  # XXX - this could decide what hash was passed and return the type for the constant index
+}
+
 #
-# typesafety::arrayob
+# typesafety::inferedob
 #
 
-package typesafety::arrayob;  
+package typesafety::inferredob;  
 
 use base 'typesafety::typeob'; 
 
-sub stuff  { 'array' }
+sub stuff  { 'inferred' }
 
 sub type :lvalue { 
   my $self = shift; 
   if((! $self->[0] or $self->[0] eq 'none') and @{$self->emits()}) {
-     typesafety::debug("typesafety::arrayob::type computing array type from emits");
+     typesafety::debug("typesafety::inferredob::type computing array type from emits");
      $self->[0] = typesafety::common_type_from_list(@{$self->emits()})->type();
   }
   if((! $self->[0] or $self->[0] eq 'none') and @{$self->accepts()}) {
-     typesafety::debug("typesafety::arrayob::type computing array type from accepts");
+     typesafety::debug("typesafety::infferedob::type computing array type from accepts");
      $self->[0] = typesafety::uncommon_type_from_list(@{$self->accepts()})->type();
   }
   if(! $self->[0] or $self->[0] eq 'none') {
-    typesafety::debug("typesafety::arrayob::type should be computing array type from emits but we have no emits or accepts yet");
+    typesafety::debug("typesafety::inferredob::type should be computing array type from emits but we have no emits or accepts yet");
   }
   $self->[0] ||= 'none'; 
   $self->[0]; 
@@ -1645,7 +1859,64 @@ sub compat {
 }
 
 #
-# other other diddling around in other packages
+# typesafety::arrayob
+#
+
+package typesafety::arrayob;
+
+use base 'typesafety::inferredob';
+
+sub stuff { 'array' }
+
+#
+# typesafety::hashob
+#
+
+package typesafety::hashob;
+
+use base 'typesafety::inferredob';
+
+sub type :lvalue {
+  my $self = shift;
+  $self->[0] = 'hash' if $self->[0] eq 'none';
+  $self->[0] ||= 'hash';
+  $self->[0];
+}
+
+sub subobjects        { $_[0]->[12] ||= {}; $_[0]->[12] }
+
+sub subscript :lvalue { $_[0]->subobjects()->{$_[1]} }
+
+#    $right->emit($expected) if $expected;
+#    $right->emit($left)
+#    $left->accept($right);
+
+sub accept { jive($_[0], $_[1], sub { $_[0]->accept($_[1]) }) }
+sub emit   { jive($_[0], $_[1], sub { $_[0]->emit($_[1])   }) }
+
+sub jive {
+  my $self = shift;
+  my $them = shift;
+  my $callback = shift;
+  return unless UNIVERSAL::isa($them, 'typesafety::hashob');
+  my %keys;
+  my $ob = sub {
+    typesafety::inferredob->new(
+        type=>'none', desc=>'hash entry of inferred type', pad=>undef, name=>$_[0],
+        package=>$lastpack, filename=>$lastfile, line=>$lastline,
+    );
+  };
+  foreach my $key (%{$self->subobjects()}) { $keys{$key}++ }
+  foreach my $key (%{$them->subobjects()}) { $keys{$key}++ }
+  foreach my $key (keys %keys) {
+    $self->subobjects()->{$key} ||= $ob->($key);
+    $them->subobjects()->{$key} ||= $ob->($key);
+    $callback->($self->subobjects()->{$key}, $them->subobjects()->{$key});
+  }
+}
+
+#
+# other diddling around in other packages
 #
 
 # none, constant, int, float, string
@@ -1662,17 +1933,17 @@ sub B::NULL::name { 'null' }
 
 =head1 NAME
 
-typesafety.pm - compile-time type usage static analysis 
+typesafety.pm - compile-time object type usage static analysis 
 
-=ABSTRACT
+=head1 ABSTRACT
 
 Perform heuristics on your program before it is run, with a goal
-of insuring that object oriented types are used consistently - the correct class
+of insuring that object oriented types are used consistently -- the correct class
 (or a subclass of it) is returned in the right places, provided in method call
 argument lists in the right places, only assigned to the right variables, and
-so on. This is a standard feature of non-dynamic languages such as Java,
-C++, and C#. Lack of this feature is one of the main reasons Perl is said
-not to be a "real" object oriented language.
+so on. 
+This is a standard feature of non-dynamic languages such as Java, C++, and C#. 
+Lack of this feature is one of the main reasons Perl is said not to be a "real" object oriented language.
 
 =head1 SYNOPSIS
 
@@ -1683,12 +1954,12 @@ not to be a "real" object oriented language.
   my FooBar $bar;            # FooBar is the base class of references $bar will hold
   my BazQux $baz;
 
-  $foo = new FooBar;         # this is okey, because $foo holds FooBars
-  $bar = $foo;               # this is okey, because $bar also holds FooBars
+  $foo = new FooBar;         # this is okay, because $foo holds FooBars
+  $bar = $foo;               # this is okay, because $bar also holds FooBars
   # $foo = 10;               # this would throw an error - 10 is not a FooBar
   # $baz = $foo;             # not allowed - FooBar isn't a BazQux
   $foo = $baz;               # is allowed -  BazQux is a FooBar because of inheritance
-  $bar = $foo->foo($baz, 1); # this is okey, as FooBar::foo() returns FooBars also
+  $bar = $foo->foo($baz, 1); # this is okay, as FooBar::foo() returns FooBars also
 
   typesafety::check();   # perform type check static analysis
 
@@ -1701,11 +1972,11 @@ not to be a "real" object oriented language.
   # proto 'new', returns => 'FooBar'; 
 
   sub new {
-    bless [], $_[0]; 
-    # or: bless whatever, __PACKAGE__;
-    # or: bless whatever, 'FooBar';
-    # or: my $type = shift; bless whatever, $type;
-    # or: my $type = shift; $type = ref $type if ref $type; bless whatever, $type;
+      bless [], $_[0]; 
+      # or: bless whatever, __PACKAGE__;
+      # or: bless whatever, 'FooBar';
+      # or: my $type = shift; bless whatever, $type;
+      # or: my $type = shift; $type = ref $type if ref $type; bless whatever, $type;
   }
 
   sub foo (FooBar; BazQux, undef) { my $me = shift; return $me->new(); } 
@@ -1720,13 +1991,48 @@ not to be a "real" object oriented language.
 
 =head1 DESCRIPTION
 
-This software is BETA! Critical things seem to work, but it needs more testing
-(for bugs and usability) from the public before I can call it "1.0". The API
-is subject to change (and has already changed with each version so far).
+This module is similar to "strict.pm" or "taint.pm" in that it checks your
+program for classes of possible errors.
+It identifies possible data flow routes and performs heuristics on the data flow
+to rule out the possibility of the 
+
+=head2 Important
+
+This software is BETA! 
+Critical things seem to work, but it needs more testing
+(for bugs and usability) from the public before I can call it "1.0". 
+The API is subject to change (and has already changed with each version so far).
 This is the first version where I'm happy with the basic functionality and
 consider it usable, so I'm calling it beta.
+While it correctly makes sense of a lot of code related to types in OO, there's still a lot
+of code out there in the wild that it mistakes for an object related construct and causes
+death and internal bleeding when it foolishly tries to swollow it.
 
-Hueristics similiar to "taint.pm" track dataflow.
+IMPORTANT:
+This module depends on L<B::Generate>, but the version up on CPAN doesn't
+build cleanly against current versions of Perl.
+I have a modified version of B::Generate up in my area that works, at least for me.
+As I write this, Perl 5.8.8 is current.
+
+IMPORTANT:
+Like adapting a Perl 4 program to compile cleanly on Perl 5 with strict and
+warnings in effect, adapting a Perl 5 program to cleanly pass type checking
+is a major undertaking.  
+And like adapting a Perl 4 program for strict, it takes some self-education
+and adjustment on the part of the programmer.
+Also like adapting a program for strict, it's an extremely rewarding habit
+to get into for a program that might grow to tens of thousands of lines.
+I suggest making it a corporate project (with large sums of money budged
+towards consulting fees for me) or else for the adventurous and broad-minded.
+
+IMPORTANT-ish:
+There's a good tutorial on strong typing (type safety, type checking)
+in my _Perl 6 Now: The Core Ideas Illustrated with Perl 5_ along with
+loads of other great stuff (you should buy it just for the two chapters
+on coroutines).
+See L<http://perl6now.com> for excerpts, more plugging, and links to buy.
+
+=head2 Strong Typing
 
 Failure to keep track what kind of data is in a given variable or returned 
 from a given method is an epic source of confusion and frustration during
@@ -1953,6 +2259,15 @@ My favorite section!
 
 Yes, every module I write mentions Damian Conway =)
 
+Testing 13 is commented out because it was failing ( C<< $foo{bar} = $foo{baz} >> where each slot held a different object type).
+
+Constructs like C<< $foo->bar->() >> were kicking its butt (functions that return closures) and probably still are. 
+Not sure about closure handling.  
+This is on my todo. 
+Not having it is an embarasement.
+
+C<my Foo $bar> is used by L<fields> as well.
+
 Blesses are only recognized as returning a given type when not used with a variable,
 or when used with C<< $_[0] >>.
 E.g., all of these are recognized: C<< bless {}, 'FooBar' >>, 
@@ -2012,6 +2327,8 @@ understand, it barfs.
 We use L<B::Generate> just for the C<< ->sv() >> method. Nothing else. I promise! We're not modifying
 the byte code tree, just reporting on it. I B<do> have some ideas for using L<B::Generate>,
 but don't go off thinking that this module does radical run time self modifying code stuff.
+XXX this should go anyway; B has equivilents but it needs a wrapper to switch on the object type to get the right one for the
+situation.
 
 The root (code not in functions) of C<main::> is checked, but not the roots of other modules.
 I don't know how to get a handle on them. Sorry. Methods and functions in C<main::> and other
@@ -2054,6 +2371,13 @@ That might look something like:
 This would first require support for hashes, period. Then support for types on individual hash
 keys when hash keys are literal constants. 
 
+Support for hashes is also sorely needed for type safe access to instance variables:
+
+  sub foo (FooBar; undef) {
+    my $self = shift; 
+    return $self->{0}; # XXX dies, even if we always store only FooBars in $self->{0}!
+  }
+
 Scalars without explicitly defined types and method parameters to unprototyped methods
 should be given the same treatment as arrays - the type usage history should be
 tracked, and if an inconsistency is found, it should be reported.
@@ -2080,7 +2404,7 @@ happy. If no one else cares, then neither do I.
 
 =head1 HISTORY
 
-This is the fourth snapshot.
+This is the fifth snapshot.
 The first was ugly, ugly, ugly and contained horrific bugs and the implementation
 was lacking. The second continued to lack numerous critical features but the code
 was radically cleaned up. In the third version, I learned about the context bits
@@ -2094,6 +2418,18 @@ indexing argument array and got generic types for arrays working. Version
 four also introduced the concept of literal values beyond just object types,
 needed to make the bless() idioms work.
 The interface is in flux and has changed between each version. 
+The fourth one was pretty good but has essentially no users, so I kind of 
+ignored the whole mess for a while.
+The fifth version makes the thing more tolerant of closures but it still doesn't do the
+right thing.
+Some constant expressions were stumping it (duh).
+There were some fixes that really didn't seem right to me... it didn't seem to be able to cope with untyped function calls at all, but I was certain that it just ignored all untyped stuff. 
+Another thing that was confusing it was functions that were exported into the checked namespace from other modules --
+it should have been ignoring those, and now it is.
+Some more places uses PVX rather than sv to get strings without meta-information tacked on after nulls.
+I forget what they were (it happened a few months ago) but there were some other fixes for 5.8.8.
+I didn't get to clean up (and spell check) the docuemntation or add new features in this
+release, but a new release was over due.
 
 =head1 OTHER MODULES
 
@@ -2113,6 +2449,8 @@ Object Oriented theory, good design, and hotrodding Perl. The current
 working version is always at L<http://perldesignpatterns.com>. 
 
 =head1 SEE ALSO
+
+See "Pragmatic Modules" in L<perlmodlib>.
 
 L<types>, by Arthur Bergman - C style type checking on strings, integers,
 and floats. 
@@ -2439,3 +2777,230 @@ argument list.
 
 good luck!
 -scott
+
+-------------
+
+OPpOUR_INTRO, OPpLVAL_INTRO when $op->name =~ /^(gv|rv2)[ash]v$/
+
+------------
+
+sub populate_curcvlex {
+    my $self = shift;
+    for (my $cv = $self->{'curcv'}; class($cv) eq "CV"; $cv = $cv->OUTSIDE) {
+        my @padlist = $cv->PADLIST->ARRAY;
+        my @ns = $padlist[0]->ARRAY;
+
+        for (my $i=0; $i<@ns; ++$i) {
+            next if class($ns[$i]) eq "SPECIAL";
+            next if $ns[$i]->FLAGS & SVpad_OUR;  # Skip "our" vars
+            if (class($ns[$i]) eq "PV") {
+                # Probably that pesky lexical @_
+                next;
+            }
+            my $name = $ns[$i]->PVX;
+            my $seq_st = $ns[$i]->NVX;
+            my $seq_en = int($ns[$i]->IVX);
+
+            push @{$self->{'curcvlex'}{$name}}, [$seq_st, $seq_en];
+        }
+    }
+}
+
+----------
+
+
+sub find_scope_st { ((find_scope(@_))[0]); }
+sub find_scope_en { ((find_scope(@_))[1]); }
+
+# Recurses down the tree, looking for pad variable introductions and COPs
+sub find_scope {
+    my ($self, $op, $scope_st, $scope_en) = @_;
+    carp("Undefined op in find_scope") if !defined $op;
+    return ($scope_st, $scope_en) unless $op->flags & OPf_KIDS;
+
+    for (my $o=$op->first; $$o; $o=$o->sibling) {
+        if ($o->name =~ /^pad.v$/ && $o->private & OPpLVAL_INTRO) {
+            my $s = int($self->padname_sv($o->targ)->NVX);
+            my $e = $self->padname_sv($o->targ)->IVX;
+            $scope_st = $s if !defined($scope_st) || $s < $scope_st;
+            $scope_en = $e if !defined($scope_en) || $e > $scope_en;
+        }
+        elsif (is_state($o)) {
+            my $c = $o->cop_seq;
+            $scope_st = $c if !defined($scope_st) || $c < $scope_st;
+            $scope_en = $c if !defined($scope_en) || $c > $scope_en;
+        }
+        elsif ($o->flags & OPf_KIDS) {
+            ($scope_st, $scope_en) =
+                $self->find_scope($o, $scope_st, $scope_en)
+        }
+    }
+
+    return ($scope_st, $scope_en);
+}
+
+----------
+
+sub pp_unstack { return "" } # see also leaveloop
+
+sub pp_stub {
+    my $self = shift;
+    my($op, $cx, $name) = @_;
+    if ($cx) {
+        return "()";
+    }
+    else {
+        return "();";
+    }
+}   
+
+----------
+
+sub pp_exists {
+    my $self = shift;
+    my($op, $cx) = @_;
+    my $arg;
+    if ($op->private & OPpEXISTS_SUB) {
+        # Checking for the existence of a subroutine
+        return $self->maybe_parens_func("exists",
+                                $self->pp_rv2cv($op->first, 16), $cx, 16);
+    }
+    if ($op->flags & OPf_SPECIAL) {
+        # Array element, not hash element
+        return $self->maybe_parens_func("exists",
+                                $self->pp_aelem($op->first, 16), $cx, 16);
+    }
+    return $self->maybe_parens_func("exists", $self->pp_helem($op->first, 16),
+                                    $cx, 16);
+}
+
+sub pp_delete {
+    my $self = shift;
+    my($op, $cx) = @_;
+    my $arg;
+    if ($op->private & OPpSLICE) {
+        if ($op->flags & OPf_SPECIAL) {
+            # Deleting from an array, not a hash
+            return $self->maybe_parens_func("delete",
+                                        $self->pp_aslice($op->first, 16),
+                                        $cx, 16);
+        }
+        return $self->maybe_parens_func("delete",
+                                        $self->pp_hslice($op->first, 16),
+                                        $cx, 16);
+    } else {
+        if ($op->flags & OPf_SPECIAL) {
+            # Deleting from an array, not a hash
+            return $self->maybe_parens_func("delete",
+                                        $self->pp_aelem($op->first, 16),
+                                        $cx, 16);
+        }
+        return $self->maybe_parens_func("delete",
+                                        $self->pp_helem($op->first, 16),
+                                        $cx, 16);
+    }
+}
+
+----------
+
+        } elsif (!null($kid->sibling) and
+                 $kid->sibling->name eq "anoncode") {
+            return "sub " .
+                $self->deparse_sub($self->padval($kid->sibling->targ));
+
+
+
+----------
+
+http://groups.google.com/groups?threadm=200208052352.g75NqGj05578%40crypt.compulink.co.uk
+http://groups.google.com/groups?threadm=3D511373.8050706%40hexaflux.com
+
+
+-----------
+
+Of course, untyped arrays and hashes will be just as acceptable as they are currently. But a language can only run so fast when you force it to defer all type checking and method lookup till run time.
+
+The intent is to make use of type information where it's useful, and not require it where it's not. Besides performance and safety, one other place where type information is useful is in writing interfaces to other languages.
+
+-apo2
+
+------
+
+In Perl 5, a lot of contextual processing was done at run-time, and even then, a given function could only discover whether it was in void, scalar or list context. In Perl 6, we will extend the notion of context to be more amenable to both compile-time and run-time analysis. In particular, a function or method can know (theoretically even at compile time) when it is being called in:
+
+    Void context
+    Scalar context
+        Boolean context
+        Integer context
+        Numeric context
+        String context
+        Object context
+    List context
+        Flattening list context (true list context).
+        Non-flattening list context (list of scalars/objects)
+        Lazy list context (list of closures)
+        Hash list context (list of pairs)
+
+-apo2
+
+--------------------------
+
+lightbright# perl -MO=Concise
+my %hash1;
+my %hash2;
+
+$hash1{foo} = new FooBar;
+$hash2{foo} = new WrongType;
+$hash1{foo} = $hash2{foo};
+w  <@> leave[1 ref] vKP/REFC ->(end)
+1     <0> enter ->2
+2     <;> nextstate(main 1 -:1) v ->3
+3     <0> padhv[%hash1:1,3] vM/LVINTRO ->4
+4     <;> nextstate(main 2 -:2) v ->5
+5     <0> padhv[%hash2:2,3] vM/LVINTRO ->6
+6     <;> nextstate(main 3 -:4) v ->7
+e     <2> sassign vKS/2 ->f
+a        <1> entersub[t3] sKS/TARG ->b
+7           <0> pushmark s ->8
+8           <$> const(PV "FooBar") sM/BARE ->9
+9           <$> method_named(PVIV "new") s ->a
+d        <2> helem sKRM*/2 ->e
+b           <0> padhv[%hash1:1,3] sR ->c
+c           <$> const(PVIV "foo") s/BARE ->d
+f     <;> nextstate(main 3 -:5) v ->g
+n     <2> sassign vKS/2 ->o
+j        <1> entersub[t4] sKS/TARG ->k
+g           <0> pushmark s ->h
+h           <$> const(PV "WrongType") sM/BARE ->i
+i           <$> method_named(PVIV "new") s ->j
+m        <2> helem sKRM*/2 ->n
+k           <0> padhv[%hash2:2,3] sR ->l
+l           <$> const(PVIV "foo") s/BARE ->m
+o     <;> nextstate(main 3 -:6) v ->p
+v     <2> sassign vKS/2 ->w
+r        <2> helem sK/2 ->s
+p           <0> padhv[%hash2:2,3] sR ->q
+q           <$> const(PVIV "foo") s/BARE ->r
+u        <2> helem sKRM*/2 ->v
+s           <0> padhv[%hash1:1,3] sR ->t
+t           <$> const(PVIV "foo") s/BARE ->u
+
+-------------
+
+%hash1 = %hash2;
+
+11    <2> aassign[t5] vKS ->12
+-        <1> ex-list lK ->z
+x           <0> pushmark s ->y
+y           <0> padhv[%hash2:837,838] l ->z
+-        <1> ex-list lK ->11
+z           <0> pushmark s ->10
+10          <0> padhv[%hash1:836,838] lRM* ->11
+
+
+
+
+
+----------------------------
+
+

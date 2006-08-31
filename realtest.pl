@@ -175,6 +175,20 @@ my WrongType $wt2;
 # $wt2 = $arr1[0]; # illegal - @arr1 will consider itself to be of type FooBar at this point, incompatable with WrongType
 
 #
+# hash type inferance
+#
+
+my %hash1;
+my %hash2;
+
+$hash1{foo} = new FooBar;
+$hash2{foo} = new WrongType;
+
+# $hash1{foo} = $hash2{foo}; # illegal - cannot assign WrongType to FooBar - woo, works!
+
+# %hash1 = %hash2; # illegal - same reason
+
+#
 # and, go!
 #
 

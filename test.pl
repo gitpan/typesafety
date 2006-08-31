@@ -55,6 +55,7 @@ my $faketest = sub {
 };
 
 for my $i (1..10) {
+  # XXX should be ..11 but test 13 is broken ($hash{foo} = $hash{bar})
   $faketest->($i);
 }
 
